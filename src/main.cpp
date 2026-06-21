@@ -129,9 +129,10 @@ static void run_dfu_sequence() {
               (unsigned long)s_bundle.dat.size);
 
   const config::Config& cfg = config::current();
-  const uint8_t  retries  = cfg.retries;
-  const uint16_t cooldown = cfg.retry_cooldown;
-  uint8_t        dfu_attempt = 0;
+  const uint8_t  retries        = cfg.retries;
+  const uint16_t cooldown       = cfg.retry_cooldown;
+  const uint16_t wedge_cooldown = cfg.wedge_cooldown;
+  uint8_t        dfu_attempt    = 0;
 
   // After a buttonless trigger we remember the app-mode MAC and pass it into
   // the next scan so the scanner also accepts MAC / MAC+1 hits — covers
@@ -176,9 +177,21 @@ static void run_dfu_sequence() {
     dfu_attempt++;
     logger::log("dfu: attempt %u/%u failed with result=%d",
                 dfu_attempt, retries, (int)r);
-    if (dfu_attempt < retries && cooldown > 0) {
-      logger::log("dfu: cooldown %u s before next attempt", cooldown);
-      delay((uint32_t)cooldown * 1000);
+    if (dfu_attempt < retries) {
+      // Classify the failure to pick a cooldown. Pre-connect failures
+      // (link never came up, dropped during setup) — short cooldown, the
+      // peer is fine, we just need to rescan. Post-connect failures
+      // (service/char missing, response timeout, protocol error, mid-stream
+      // drop) suggest the bootloader's DFU state machine is wedged from a
+      // half-finished session; only its internal inactivity watchdog
+      // unsticks it, so we wait the longer `wedge_cooldown`.
+      bool wedge = (r != dfu_legacy::Result::kConnectFailed);
+      uint16_t wait_s = wedge ? wedge_cooldown : cooldown;
+      if (wait_s > 0) {
+        logger::log("dfu: %s cooldown %u s before next attempt",
+                    wedge ? "wedge" : "retry", wait_s);
+        delay((uint32_t)wait_s * 1000);
+      }
     }
   }
 
@@ -284,10 +297,10 @@ void setup() {
   logger::log("boot: storage=%s vbus=%d cfg=%s",
               s_storage_ok ? "ok" : "fail", (int)vbus,
               cfg_loaded ? "CONFIG.TXT" : "defaults");
-  logger::log("cfg:  ble_name='%s' prn=%u high_mtu=%d retries=%u min_rssi=%d retry_cooldown=%u tx_power=%d scan_timeout=%u scan_debug=%d",
+  logger::log("cfg:  ble_name='%s' prn=%u high_mtu=%d retries=%u min_rssi=%d retry_cooldown=%u wedge_cooldown=%u tx_power=%d scan_timeout=%u scan_debug=%d",
               cfg.ble_name, cfg.prn, (int)cfg.high_mtu, cfg.retries,
-              (int)cfg.min_rssi, cfg.retry_cooldown, (int)cfg.tx_power,
-              cfg.scan_timeout, (int)cfg.scan_debug);
+              (int)cfg.min_rssi, cfg.retry_cooldown, cfg.wedge_cooldown,
+              (int)cfg.tx_power, cfg.scan_timeout, (int)cfg.scan_debug);
 
   // Boot-without-USB-power trigger: if we came up on battery and there's
   // already a zip on the drive, jump straight into DFU. This matches the

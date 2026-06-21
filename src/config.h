@@ -33,6 +33,14 @@ struct Config {
   // and slamming retries returns INVALID_STATE.
   uint16_t retry_cooldown;
 
+  // Extended cooldown used after a *post-connect* failure (response timeout,
+  // protocol error, link drop mid-stream). SDK 11-era bootloaders that wedge
+  // mid-DFU only unstick when their internal inactivity watchdog fires —
+  // usually 60–120 s. Pre-connect failures (weak signal, link never came up)
+  // still use the short `retry_cooldown`; only failures past the GATT handshake
+  // use this one.
+  uint16_t wedge_cooldown;
+
   // BLE transmit power in dBm. nRF52840 valid values:
   //   -40, -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 7, 8
   // Default 0. Crank to 8 for max range (drone use); SoftDevice will reject

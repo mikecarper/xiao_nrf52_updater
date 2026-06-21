@@ -2,7 +2,7 @@
 # Examples:
 # RAK4631_OTA | 4631_DFU
 # SENSECAP_SOLAR_OTA
-ble_name=
+ble_name=4631 | DFU
 
 # Packet Receipt Notification cadence (writes per ACK from the peer).
 # 10 is the safe Nordic default. Higher = faster but risk overflowing the
@@ -20,10 +20,17 @@ retries=10
 # settle after a reset before it'll accept another START_DFU.
 retry_cooldown=5
 
+# Seconds to wait after a *post-connect* failure (response timeout, protocol
+# error, link drop mid-stream). SDK 11-era bootloaders (stock Adafruit /
+# RAK4631) that wedge mid-DFU only unstick when their internal inactivity
+# watchdog fires — usually 60-120 s. Pre-connect failures still use the short
+# retry_cooldown above.
+wedge_cooldown=60
+
 # Minimum RSSI (dBm, negative). Ads weaker than this are rejected during
 # scan. -127 = no minimum. Useful on a drone to refuse flashing when
 # the signal isn't strong enough to reliably stream.
-min_rssi=-75
+min_rssi=-70
 
 # BLE TX power in dBm. nRF52840 allowed values:
 #   -40, -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 7, 8

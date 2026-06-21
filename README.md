@@ -66,6 +66,13 @@ retries=3
 # settle after a reset before it'll accept another START_DFU.
 retry_cooldown=5
 
+# Seconds to wait after a *post-connect* failure (response timeout,
+# protocol error, link drop mid-stream). SDK 11-era bootloaders (stock
+# Adafruit / RAK4631) that wedge mid-DFU only unstick when their internal
+# inactivity watchdog fires — usually 60-120 s. Pre-connect failures still
+# use the short retry_cooldown above.
+wedge_cooldown=60
+
 # Minimum RSSI (dBm, negative). Ads weaker than this are rejected during
 # scan. -127 = no minimum. Useful on a drone to refuse flashing when
 # the signal isn't strong enough to reliably stream.

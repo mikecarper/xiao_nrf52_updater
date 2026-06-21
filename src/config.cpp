@@ -14,6 +14,7 @@ static void apply_defaults(Config* c) {
   c->retries          = 3;
   c->min_rssi         = -90;  // minimal viable signal
   c->retry_cooldown = 5;
+  c->wedge_cooldown = 60;
   c->tx_power       = 4;
   c->scan_timeout   = 0;     // 0 = infinite, scan forever
   c->scan_debug     = false;
@@ -51,6 +52,9 @@ static void apply_kv(Config* c, const char* key, const char* val) {
   } else if (!strcmp(key, "retry_cooldown")) {
     int n = atoi(val);
     if (n >= 0 && n <= 600) c->retry_cooldown = (uint16_t)n;
+  } else if (!strcmp(key, "wedge_cooldown")) {
+    int n = atoi(val);
+    if (n >= 0 && n <= 600) c->wedge_cooldown = (uint16_t)n;
   } else if (!strcmp(key, "tx_power")) {
     int n = atoi(val);
     // We don't enforce the allowed-values list here; Bluefruit::setTxPower
