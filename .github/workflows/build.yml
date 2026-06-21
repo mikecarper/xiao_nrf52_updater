@@ -55,7 +55,7 @@ jobs:
           # Tag pushes get versioned names; manual runs just use the build name.
           VER="${GITHUB_REF_NAME}"
           [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
-          BASE="xiao_nrf52_updater-${{ matrix.env }}-${VER}"
+          BASE="updater-${{ matrix.env }}-${VER}"
           cp .pio/build/${{ matrix.env }}/firmware.hex out/${BASE}.hex
           cp .pio/build/${{ matrix.env }}/firmware.zip out/${BASE}.zip
           cp .pio/build/${{ matrix.env }}/firmware.uf2 out/${BASE}.uf2

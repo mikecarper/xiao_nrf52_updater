@@ -1,6 +1,5 @@
 # xiao_nrf52_updater
 
-
 A standalone BLE DFU client that runs on a **Seeed XIAO nRF52840**, **RAK4631** (with RAK15001 QSPI flash) and flashes Nordic-format firmware bundles to *other* nRF52 devices over Bluetooth. Drag a `.zip` onto the board's USB drive, eject it (or unplug if running on battery), and the board connects to a nearby DFU target and flashes it.
 
 <p align="center">
@@ -8,13 +7,13 @@ A standalone BLE DFU client that runs on a **Seeed XIAO nRF52840**, **RAK4631** 
   <sup>DJI Neo 2 with Seeed Xiao nRF52 and 600mA battery: 10g payload</sup>
 </p>
 
-Intended use: a drone-mounted programmer that updates a remote nRF52 payload in the field, without a phone or laptop in the loop.
+Intended use: a drone-mounted OTA flasher that updates a hard to reach nRF52 repeater in the field.
 
 ## What's in the box
 
 | Component | Role |
 |---|---|
-| **USB MSC** | Exposes a 2 MB QSPI flash as a FAT12 USB drive (label `XIAO DFU` on XIAO, `RAK DFU` on RAK4631). The host drops the `.zip` and the optional `CONFIG.TXT` here. |
+| **USB MSC** | Exposes a 2 MB QSPI flash as a FAT12 USB drive (label `XIAO DFU` on XIAO, `RAK DFU` on RAK4631). The host drops the host firmware `.zip` and the `CONFIG.TXT` here. |
 | **`CONFIG.TXT`** | `key=value` config (BLE name filter, PRN, MTU, retries, min RSSI, retry cooldown). |
 | **`LOG.TXT`** | Append-only log written by the firmware between sessions. |
 | **BLE central** | Bluefruit central; scans for the Nordic Legacy DFU service UUID. |
@@ -42,7 +41,7 @@ Only one runs per boot; after success or final failure the firmware sits idle un
 
 ## CONFIG.TXT
 
-Optional. `key=value` per line, `#` or `;` start a comment, whitespace trimmed. Missing keys use defaults.
+`key=value` per line, `#` or `;` start a comment, Missing keys use defaults.
 
 ```
 # Substring filter for advertised BLE name. Empty = any peer with DFU service.
