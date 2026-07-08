@@ -45,6 +45,8 @@ void set_debug(bool on);
 bool find_first(Target* out, uint32_t timeout_ms,
                 const char* name_filter = nullptr,
                 int8_t min_rssi = -127,
-                const ble_gap_addr_t* prefer_mac = nullptr);
+                const ble_gap_addr_t* prefer_mac = nullptr,
+                const ble_gap_addr_t* target_mac = nullptr
+);
 
 }  // namespace ble_scanner

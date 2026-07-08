@@ -81,6 +81,20 @@ static bool scan_for_target(ble_scanner::Target* out,
                             const ble_gap_addr_t* prefer_mac = nullptr) {
   const config::Config& cfg = config::current();
   uint32_t timeout_ms = (uint32_t)cfg.scan_timeout * 1000;
+  ble_gap_addr_t target_mac_addr = {};
+  const ble_gap_addr_t* target_mac = nullptr;
+  bool has_name_filter = (cfg.ble_name[0] != '\0');
+
+  if (!has_name_filter && cfg.ble_mac_set) {
+    memcpy(target_mac_addr.addr, cfg.ble_mac, 6);
+    target_mac = &target_mac_addr;
+
+    logger::log(
+      "scan: fixed MAC target %02X:%02X:%02X:%02X:%02X:%02X",
+      cfg.ble_mac[5], cfg.ble_mac[4], cfg.ble_mac[3],
+      cfg.ble_mac[2], cfg.ble_mac[1], cfg.ble_mac[0]
+    );
+  }
   if (cfg.scan_timeout == 0) {
     logger::log("scan: looking for DFU target (no timeout)%s...",
                 prefer_mac ? ", MAC+1 fallback armed" : "");
@@ -88,7 +102,7 @@ static bool scan_for_target(ble_scanner::Target* out,
     logger::log("scan: looking for DFU target (%u s timeout)%s...",
                 cfg.scan_timeout, prefer_mac ? ", MAC+1 fallback armed" : "");
   }
-  if (!ble_scanner::find_first(out, timeout_ms, cfg.ble_name, cfg.min_rssi, prefer_mac)) {
+  if (!ble_scanner::find_first(out, timeout_ms, cfg.ble_name, cfg.min_rssi, prefer_mac, target_mac)) {
     logger::log("scan: timed out, no target found");
     return false;
   }

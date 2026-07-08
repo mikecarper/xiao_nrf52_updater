@@ -16,6 +16,7 @@ static Target                s_match;
 static const char*           s_name_filter = nullptr;   // nullptr or "" = accept any
 static int8_t                s_min_rssi    = -127;      // -127 = no minimum
 static const ble_gap_addr_t* s_prefer_mac  = nullptr;   // optional MAC / MAC+1 fast-path
+static const ble_gap_addr_t* s_target_mac  = nullptr;   // strict CONFIG.TXT ble_mac target
 static bool                  s_debug       = false;     // verbose per-ad log
 
 void set_debug(bool on) { s_debug = on; }
@@ -115,26 +116,52 @@ static void scan_cb(ble_gap_evt_adv_report_t* report) {
   }
 
   // Filter strategy. Accept the ad if any of these holds:
-  //   1. `prefer_mac` is set and the report's MAC == ref or ref+1 (used
-  //      right after a buttonless trigger so we don't lose the target
-  //      when the bootloader advertises under a different name).
-  //   2. A name filter is configured and the name matches (pipe-delimited
-  //      OR of substring patterns).
-  //   3. No name filter is configured and the ad carries the Legacy DFU
-  //      service UUID (typical of bootloader-mode targets).
-  bool mac_ok       = mac_match_or_plus_one(report->peer_addr, s_prefer_mac);
-  bool has_name     = (s_name_filter && s_name_filter[0] != '\0');
-  bool name_ok      = has_name && name_matches(candidate.name, s_name_filter);
-  bool need_uuid    = !mac_ok && !has_name;
-  bool uuid_ok      = false;
+  //
+  // 1. Strict CONFIG.TXT ble_mac mode:
+  //    When no ble_name is configured and target_mac is set, accept only
+  //    the configured MAC or MAC+1. Do not fall back to random DFU UUID devices.
+  //
+  // 2. Existing prefer_mac fast-path:
+  //    Used after buttonless DFU trigger, accepts app MAC or MAC+1.
+  //
+  // 3. Existing ble_name filter.
+  //
+  // 4. Existing fallback:
+  //    When neither ble_name nor ble_mac is configured, accept Legacy DFU UUID.
+
+  bool has_name = (s_name_filter && s_name_filter[0] != '\0');
+
+  // Strict MAC mode from CONFIG.TXT.
+  // This is intentionally before the old UUID fallback.
+  if (!has_name && s_target_mac) {
+    bool target_mac_ok = mac_match_or_plus_one(report->peer_addr, s_target_mac);
+    bool prefer_mac_ok = mac_match_or_plus_one(report->peer_addr, s_prefer_mac);
+
+    if (!(target_mac_ok || prefer_mac_ok)) {
+      log_seen(report, candidate.name, "mac?");
+      Bluefruit.Scanner.resume();
+      return;
+    }
+
+    s_match = candidate;
+    s_found = true;
+    Bluefruit.Scanner.stop();
+    return;
+  }
+
+  // Original behavior follows.
+  bool mac_ok = mac_match_or_plus_one(report->peer_addr, s_prefer_mac);
+  bool name_ok = has_name && name_matches(candidate.name, s_name_filter);
+  bool need_uuid = !mac_ok && !has_name;
+  bool uuid_ok = false;
+
   if (need_uuid) {
     BLEUuid uuid(kLegacyDfuUuid128);
     uuid_ok = Bluefruit.Scanner.checkReportForUuid(report, uuid);
   }
 
   if (!(mac_ok || name_ok || uuid_ok)) {
-    const char* reason = mac_ok      ? "mac" :
-                         (has_name ? "name?" : "uuid?");
+    const char* reason = mac_ok ? "mac" : (has_name ? "name?" : "uuid?");
     log_seen(report, candidate.name, reason);
     Bluefruit.Scanner.resume();
     return;
@@ -174,11 +201,12 @@ void begin(int8_t tx_power_dbm) {
 }
 
 bool find_first(Target* out, uint32_t timeout_ms, const char* name_filter,
-                int8_t min_rssi, const ble_gap_addr_t* prefer_mac) {
+                int8_t min_rssi, const ble_gap_addr_t* prefer_mac, const ble_gap_addr_t* target_mac) {                    
   s_found       = false;
   s_name_filter = name_filter;
   s_min_rssi    = min_rssi;
   s_prefer_mac  = prefer_mac;
+  s_target_mac = target_mac;
   memset(&s_match, 0, sizeof(s_match));
 
   Bluefruit.Scanner.start(0);  // 0 = scan until told to stop

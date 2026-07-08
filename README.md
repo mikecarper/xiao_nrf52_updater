@@ -14,18 +14,18 @@ Intended use: a drone-mounted OTA flasher that updates a hard to reach nRF52 rep
 | Component | Role |
 |---|---|
 | **USB MSC** | Exposes a 2 MB QSPI flash as a FAT12 USB drive (label `XIAO DFU` on XIAO, `RAK DFU` on RAK4631). The host drops the host firmware `.zip` and the `CONFIG.TXT` here. |
-| **`CONFIG.TXT`** | `key=value` config (BLE name filter, PRN, MTU, retries, min RSSI, retry cooldown). |
+| **`CONFIG.TXT`** | `key=value` config (BLE name filter, optional fixed BLE MAC target, PRN, MTU, retries, min RSSI, retry cooldown). |
 | **`LOG.TXT`** | Append-only log written by the firmware between sessions. |
-| **BLE central** | Bluefruit central; scans for the Nordic Legacy DFU service UUID. |
+| **BLE central** | Bluefruit central; scans for the Nordic Legacy DFU service UUID, advertised BLE names, or an optional fixed BLE MAC target. |
 | **DFU client** | Implements the Nordic Legacy DFU protocol (mirrors the Android `LegacyDfuImpl.java`), including the buttonless trigger for app-mode targets. |
 
 ## Workflow
 
 1. Plug the XIAO into a host. The `XIAO DFU` drive appears.
 2. Drop a firmware bundle (`*.zip` produced by `nrfutil pkg generate`) into the drive root.
-3. Copy a `CONFIG.TXT` from the repo and change `ble_name`, so it matches with BLE name you want to update. example: `RAK4631_OTA`
+3. Copy a `CONFIG.TXT` from the repo and either set `ble_name` to match the advertised BLE name you want to update, for example `RAK4631_OTA`, or leave `ble_name` empty and set `ble_mac` to target a known BLE MAC address.
 4. **Eject the drive** (or unplug if the XIAO is battery-powered).
-5. The XIAO scans for a target advertising the Legacy DFU service, optionally sends the buttonless trigger to kick it from app mode into bootloader, then runs the full DFU sequence.
+5. The XIAO scans for a target advertising the Legacy DFU service, matching the configured BLE name, or matching the configured BLE MAC address. It optionally sends the buttonless trigger to kick the target from app mode into bootloader, then runs the full DFU sequence.
 6. On success the `.zip` is deleted from the drive; the `LOG.TXT` keeps the history.
 
 ## Triggers
@@ -43,11 +43,20 @@ Only one runs per boot; after success or final failure the firmware sits idle un
 
 `key=value` per line, `#` or `;` start a comment, Missing keys use defaults.
 
-```
-# Substring filter for advertised BLE name. Empty = any peer with DFU service.
+```ini
+# Substring filter for advertised BLE name.
+# When set, name matching has priority over ble_mac.
 # Multiple names can be OR'd with '|', useful when an app and its bootloader
-# advertise under different names, like oltaco's OTAFIX bootloader does
+# advertise under different names, like oltaco's OTAFIX bootloader does.
 ble_name=RAK4631 | 4631_DFU
+
+# Optional fixed BLE MAC target.
+# Used only when ble_name is empty.
+# Format: AA:BB:CC:DD:EE:FF
+# The scanner accepts the configured MAC or MAC+1, which matches Nordic's
+# common bootloader address convention after buttonless DFU.
+# Leave empty to use the original UUID fallback behavior.
+ble_mac=
 
 # Packet Receipt Notification cadence (writes per ACK from the peer).
 # 10 is the safe Nordic default. Higher = faster but risk overflowing the
@@ -96,9 +105,11 @@ scan_debug=0
 
 Notes:
 
-- A configured `ble_name` switches the scanner from UUID matching to **name-substring** matching. Most Nordic app-mode firmwares expose the Legacy DFU service in their GATT database but do not advertise the UUID; matching on the device name is the only way to find them before connecting. Without `ble_name`, only peers that explicitly advertise the Legacy DFU service UUID are considered (typical of bootloader-mode targets).
+- A configured `ble_name` switches the scanner from UUID matching to **name-substring** matching. Most Nordic app-mode firmwares expose the Legacy DFU service in their GATT database but do not advertise the UUID; matching on the device name is often the only way to find them before connecting.
+- If `ble_name` is empty and `ble_mac` is configured, the scanner uses **strict MAC matching** instead. Only the configured BLE MAC address or MAC+1 is accepted. This is useful when the target name is unknown, missing, shortened, or changes between app mode and bootloader mode.
+- If both `ble_name` and `ble_mac` are empty, the original fallback behavior is used: only peers that explicitly advertise the Legacy DFU service UUID are considered, which is typical of bootloader-mode targets.
 - `ble_name` accepts multiple substrings joined by `|`. Example: `RAK4631 | 4631_DFU` matches the RAK app *and* its bootloader, which advertise under different names.
-- **MAC+1 fallback after buttonless**: after we send the buttonless trigger, the next scan automatically also accepts the same MAC or MAC+1 (Nordic's bootloader convention). This is on top of the name filter, so even if the bootloader's name doesn't match `ble_name`, the address-based fallback finds it.
+- **MAC+1 fallback after buttonless**: after we send the buttonless trigger, the next scan automatically also accepts the same MAC or MAC+1 (Nordic's bootloader convention). This works both for the existing buttonless flow and for the optional `ble_mac` target mode.
 
 `retries` only counts post-scan DFU attempts. Scan failures (with `scan_timeout=0`, impossible) and buttonless triggers don't consume retries.
 
@@ -127,6 +138,15 @@ The log is mirrored to both Serial (USB CDC) and to `LOG.TXT` on the drive. **Th
 | Mounted on host | ✓ | skipped |
 | Ejected (USB still plugged) | ✓ | ✓ |
 | USB unplugged | nothing reads it | ✓ |
+
+Useful scan/debug lines when `ble_mac` is configured:
+
+```text
+cfg: ble_mac=AA:BB:CC:DD:EE:FF
+scan: fixed MAC target AA:BB:CC:DD:EE:FF
+```
+
+When `scan_debug=1`, advertisements rejected because they do not match the configured MAC target are logged with reason `mac?`.
 
 ## Supported DFU bundles
 
@@ -169,7 +189,7 @@ No bootloader replacement is required on either board — the factory UF2 bootlo
 
 ## Project layout
 
-```
+```text
 src/
   main.cpp           - state machine, LED rendering, triggers, glue
   storage.{h,cpp}    - QSPI flash bring-up, FAT12 mount, mini-formatter
