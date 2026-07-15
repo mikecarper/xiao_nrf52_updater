@@ -9,6 +9,11 @@ struct Config {
   // exposes the Legacy DFU service.
   char     ble_name[24];
 
+  // Optional fixed BLE MAC target from CONFIG.TXT.
+  // Used only when ble_name is empty.
+  bool ble_mac_set;
+  uint8_t ble_mac[6];
+
   // Packet Receipt Notification cadence (writes between PRN callbacks).
   // 10 is safe for SDK 6.0 bootloaders; modern ones tolerate up to ~32.
   // 0 disables PRNs entirely (faster but no flow control — risky).

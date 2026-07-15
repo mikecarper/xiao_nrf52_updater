@@ -2,7 +2,13 @@
 # Examples:
 # RAK4631_OTA | 4631_DFU
 # SENSECAP_SOLAR_OTA
+# XIAO_NRF52_OTA | XIAO_DFU
 ble_name=4631 | DFU
+
+# Optional BLE MAC target.
+# Used only when ble_name is empty.
+# Format: AA:BB:CC:DD:EE:FF
+ble_mac=
 
 # Packet Receipt Notification cadence (writes per ACK from the peer).
 # 10 is the safe Nordic default. Higher = faster but risk overflowing the
