@@ -86,41 +86,100 @@ bool parse(const char* zip_path, Parsed* out, char* err, size_t err_len) {
     return false;
   }
 
-  // The legacy bootloader can't take SD+BL+App in one go (the Java reference
-  // explicitly splits them across two connections), and we don't have a
-  // sample yet to verify that path. So we accept the simple shapes here:
-  // application / bootloader / softdevice / softdevice_bootloader.
+  // Inventory every known image section before choosing one. In particular,
+  // never silently select the first entry of a multi-image package and then
+  // delete the ZIP with another image still unapplied.
+  uint8_t sections = 0;
+  if (m["application"].is<JsonObject>()) {
+    sections |= dfu_image_layout::kApplication;
+  }
+  if (m["bootloader"].is<JsonObject>()) {
+    sections |= dfu_image_layout::kBootloader;
+  }
+  if (m["softdevice"].is<JsonObject>()) {
+    sections |= dfu_image_layout::kSoftdevice;
+  }
   if (m["softdevice_bootloader"].is<JsonObject>()) {
-    JsonObject n = m["softdevice_bootloader"];
-    if (!resolve(n, &out->bin, &out->dat, err, err_len)) goto fail;
-    out->type = TYPE_SOFTDEVICE | TYPE_BOOTLOADER;
-    // Different nrfutil versions place sizes either at the entry's top level
-    // or under info_read_only_metadata. Accept both.
-    out->sd_size = n["sd_size"] | n["info_read_only_metadata"]["sd_size"] | 0u;
-    out->bl_size = n["bl_size"] | n["info_read_only_metadata"]["bl_size"] | 0u;
-    if (out->sd_size == 0 || out->bl_size == 0) {
-      snprintf(err, err_len, "softdevice_bootloader missing sd_size / bl_size");
-      goto fail;
-    }
-  } else if (m["application"].is<JsonObject>()) {
-    if (!resolve(m["application"], &out->bin, &out->dat, err, err_len)) goto fail;
-    out->type = TYPE_APPLICATION;
-  } else if (m["bootloader"].is<JsonObject>()) {
-    if (!resolve(m["bootloader"], &out->bin, &out->dat, err, err_len)) goto fail;
-    out->type = TYPE_BOOTLOADER;
-  } else if (m["softdevice"].is<JsonObject>()) {
-    if (!resolve(m["softdevice"], &out->bin, &out->dat, err, err_len)) goto fail;
-    out->type = TYPE_SOFTDEVICE;
-  } else {
-    snprintf(err, err_len, "manifest.json: no recognised firmware section");
-    goto fail;
+    sections |= dfu_image_layout::kSoftdeviceBootloader;
+  }
+  if (m["bootloader_application"].is<JsonObject>()) {
+    sections |= dfu_image_layout::kBootloaderApplication;
+  }
+  if (m["softdevice_application"].is<JsonObject>()) {
+    sections |= dfu_image_layout::kSoftdeviceApplication;
+  }
+  if (m["softdevice_bootloader_application"].is<JsonObject>()) {
+    sections |= dfu_image_layout::kSoftdeviceBootloaderApplication;
   }
 
-  return true;
+  dfu_image_layout::ManifestSection selected;
+  dfu_image_layout::Status layout_status =
+      dfu_image_layout::select_section(sections, &selected);
+  if (layout_status != dfu_image_layout::Status::kOk) {
+    snprintf(err, err_len, "manifest.json: %s",
+             dfu_image_layout::status_message(layout_status));
+    zip_reader::close();
+    return false;
+  }
 
-fail:
-  zip_reader::close();
-  return false;
+  const char* section_name = nullptr;
+  switch (selected) {
+    case dfu_image_layout::kApplication:
+      section_name = "application";
+      break;
+    case dfu_image_layout::kBootloader:
+      section_name = "bootloader";
+      break;
+    case dfu_image_layout::kSoftdevice:
+      section_name = "softdevice";
+      break;
+    case dfu_image_layout::kSoftdeviceBootloader:
+      section_name = "softdevice_bootloader";
+      break;
+    default:
+      snprintf(err, err_len, "manifest.json: invalid firmware section");
+      zip_reader::close();
+      return false;
+  }
+
+  JsonObject node = m[section_name].as<JsonObject>();
+  if (!resolve(node, &out->bin, &out->dat, err, err_len)) {
+    zip_reader::close();
+    return false;
+  }
+
+  uint32_t combined_sd_size = 0;
+  uint32_t combined_bl_size = 0;
+  if (selected == dfu_image_layout::kSoftdeviceBootloader) {
+    // Different nrfutil versions place sizes either at the entry's top level
+    // or under info_read_only_metadata. Accept both.
+    combined_sd_size = node["sd_size"] | 0u;
+    combined_bl_size = node["bl_size"] | 0u;
+    if (combined_sd_size == 0) {
+      combined_sd_size =
+          node["info_read_only_metadata"]["sd_size"] | 0u;
+    }
+    if (combined_bl_size == 0) {
+      combined_bl_size =
+          node["info_read_only_metadata"]["bl_size"] | 0u;
+    }
+  }
+
+  dfu_image_layout::Layout layout;
+  layout_status = dfu_image_layout::make_layout(
+      selected, out->bin.size, combined_sd_size, combined_bl_size, &layout);
+  if (layout_status != dfu_image_layout::Status::kOk) {
+    snprintf(err, err_len, "manifest.json: %s",
+             dfu_image_layout::status_message(layout_status));
+    zip_reader::close();
+    return false;
+  }
+  out->type = layout.type;
+  out->sd_size = layout.sd_size;
+  out->bl_size = layout.bl_size;
+  out->app_size = layout.app_size;
+
+  return true;
 }
 
 }  // namespace firmware_zip

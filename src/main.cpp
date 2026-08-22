@@ -6,9 +6,11 @@
 
 #include "ble_scanner.h"
 #include "config.h"
+#include "deferred_logger.h"
 #include "dfu_legacy.h"
 #include "firmware_zip.h"
 #include "logger.h"
+#include "retry_policy.h"
 #include "storage.h"
 #include "usb_msc.h"
 #include "zip_reader.h"
@@ -18,7 +20,7 @@
 // ---------------------------------------------------------------------------
 // Indicator scheme:
 //   BLUE  slow blink     = idle, waiting for the host
-//   BLUE  solid          = host has the drive mounted
+//   BLUE  solid          = USB configured by a host
 //   GREEN fast blink     = DFU running
 //   GREEN solid          = DFU succeeded
 //   RED   solid          = DFU failed (XIAO; has 3 LEDs)
@@ -66,6 +68,21 @@ static void leds_tick(uint32_t now);  // forward decl
 static void on_dfu_progress(uint8_t pct) {
   s_progress_pct = pct;
   leds_tick(millis());
+}
+
+static void log_effective_config(const char* source) {
+  const config::Config& cfg = config::current();
+  logger::log("cfg: source=%s ble_name='%s' prn=%u high_mtu=%d retries=%u min_rssi=%d retry_cooldown=%u wedge_cooldown=%u tx_power=%d scan_timeout=%u scan_debug=%d",
+              source, cfg.ble_name, cfg.prn, (int)cfg.high_mtu, cfg.retries,
+              (int)cfg.min_rssi, cfg.retry_cooldown, cfg.wedge_cooldown,
+              (int)cfg.tx_power, cfg.scan_timeout, (int)cfg.scan_debug);
+  if (cfg.ble_mac_set) {
+    logger::log("cfg: ble_mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                cfg.ble_mac[5], cfg.ble_mac[4], cfg.ble_mac[3],
+                cfg.ble_mac[2], cfg.ble_mac[1], cfg.ble_mac[0]);
+  } else {
+    logger::log("cfg: ble_mac=<none>");
+  }
 }
 
 // Scan for a target advertising the Legacy DFU service (or matching the
@@ -164,7 +181,8 @@ static void run_dfu_sequence() {
       return;
     }
 
-    dfu_legacy::Result r = dfu_legacy::run(t, s_bundle, cfg);
+    dfu_legacy::RunResult run = dfu_legacy::run(t, s_bundle, cfg);
+    dfu_legacy::Result r = run.result;
 
     if (r == dfu_legacy::Result::kButtonlessTriggered) {
       logger::log("dfu: buttonless triggered, waiting 2 s for peer reboot...");
@@ -189,17 +207,20 @@ static void run_dfu_sequence() {
     }
 
     dfu_attempt++;
-    logger::log("dfu: attempt %u/%u failed with result=%d",
-                dfu_attempt, retries, (int)r);
+    logger::log("dfu: attempt %u/%u failed result=%d cleanup=%d",
+                dfu_attempt, retries, (int)r, (int)run.cleanup);
+
+    retry_policy::CooldownClass cooldown_class = retry_policy::classify(run);
+    if (cooldown_class == retry_policy::CooldownClass::kStop) {
+      logger::log("dfu: local fatal error; retries stopped");
+      break;
+    }
+
     if (dfu_attempt < retries) {
-      // Classify the failure to pick a cooldown. Pre-connect failures
-      // (link never came up, dropped during setup) — short cooldown, the
-      // peer is fine, we just need to rescan. Post-connect failures
-      // (service/char missing, response timeout, protocol error, mid-stream
-      // drop) suggest the bootloader's DFU state machine is wedged from a
-      // half-finished session; only its internal inactivity watchdog
-      // unsticks it, so we wait the longer `wedge_cooldown`.
-      bool wedge = (r != dfu_legacy::Result::kConnectFailed);
+      // A confirmed RESET gets the short retry delay. Only a session whose
+      // link vanished or had to be forced down waits for the bootloader's
+      // inactivity watchdog.
+      bool wedge = cooldown_class == retry_policy::CooldownClass::kWedge;
       uint16_t wait_s = wedge ? wedge_cooldown : cooldown;
       if (wait_s > 0) {
         logger::log("dfu: %s cooldown %u s before next attempt",
@@ -209,7 +230,7 @@ static void run_dfu_sequence() {
     }
   }
 
-  logger::log("dfu: FAILED after %u attempts", retries);
+  logger::log("dfu: FAILED after %u attempt(s)", dfu_attempt);
   zip_reader::close();
   s_state = State::kDoneFail;
 }
@@ -232,7 +253,7 @@ static void leds_tick(uint32_t now) {
 
   switch (s_state) {
     case State::kIdle:
-      if (usb_msc::is_mounted()) {
+      if (usb_msc::usb_configured()) {
         LED_RED_SET(false);
         led_set(LED_GREEN, false);
         led_set(LED_BLUE,  true);
@@ -290,17 +311,34 @@ static void leds_tick(uint32_t now) {
 void setup() {
   leds_off();
   Serial.begin(115200);
+  bool deferred_log_ok = deferred_logger::begin();
 
   bool vbus = vbus_present();
 
+  // TinyUSB starts before setup(). Hold its pull-up down while storage is
+  // probed and the final composite descriptor is assembled. This prevents a
+  // slow first-time flash format from enumerating CDC before MSC is added.
+  bool usb_suspended = usb_msc::suspend_for_descriptor_update();
+
   s_storage_ok = storage::begin();
-  // MSC is only useful while USB is connected; expose it unconditionally so
-  // the rare "plugged in after boot" case still works.
-  usb_msc::begin();
   dfu_legacy::set_progress_callback(on_dfu_progress);
 
-  bool cfg_loaded = false;
-  if (s_storage_ok) cfg_loaded = config::load();
+  // load() always establishes defaults, even if storage failed.
+  bool cfg_loaded = config::load();
+
+  // Inspect battery-trigger state before exposing the block device. If a zip
+  // is already staged, this boot belongs to firmware and USB remains CDC-only.
+  if (!vbus && s_storage_ok) {
+    char zip_name[64];
+    if (storage::find_single_zip(zip_name, sizeof(zip_name)) == 1) {
+      s_armed_boot = true;
+    }
+  }
+
+  bool msc_ok = false;
+  if (s_storage_ok && !s_armed_boot) msc_ok = usb_msc::begin();
+  usb_msc::resume_after_descriptor_update(usb_suspended);
+
   const config::Config& cfg = config::current();
 
   // BLE init has to come AFTER config so we can apply tx_power before
@@ -308,34 +346,46 @@ void setup() {
   ble_scanner::begin(cfg.tx_power);
   ble_scanner::set_debug(cfg.scan_debug);
 
-  logger::log("boot: storage=%s vbus=%d cfg=%s",
-              s_storage_ok ? "ok" : "fail", (int)vbus,
+  logger::log("boot: storage=%s msc=%s vbus=%d cfg=%s",
+              s_storage_ok ? "ok" : "fail",
+              msc_ok ? "ready" : "cdc-only", (int)vbus,
               cfg_loaded ? "CONFIG.TXT" : "defaults");
-  logger::log("cfg:  ble_name='%s' prn=%u high_mtu=%d retries=%u min_rssi=%d retry_cooldown=%u wedge_cooldown=%u tx_power=%d scan_timeout=%u scan_debug=%d",
-              cfg.ble_name, cfg.prn, (int)cfg.high_mtu, cfg.retries,
-              (int)cfg.min_rssi, cfg.retry_cooldown, cfg.wedge_cooldown,
-              (int)cfg.tx_power, cfg.scan_timeout, (int)cfg.scan_debug);
+  if (!deferred_log_ok) {
+    logger::log("boot: callback event queue unavailable");
+  }
+  log_effective_config(cfg_loaded ? "CONFIG.TXT" : "defaults");
 
   // Boot-without-USB-power trigger: if we came up on battery and there's
   // already a zip on the drive, jump straight into DFU. This matches the
   // requirements' "physical unplug → board flashes target" workflow when
   // the XIAO has a battery wired to BAT+/BAT-.
-  if (!vbus && s_storage_ok) {
-    char zip_name[64];
-    if (storage::find_single_zip(zip_name, sizeof(zip_name)) == 1) {
-      logger::log("boot: no VBUS + zip present, arming DFU");
-      s_armed_boot = true;
-    }
+  if (s_armed_boot) {
+    logger::log("boot: no VBUS + zip present, arming DFU");
   }
 }
 
 void loop() {
+  // Bluefruit callbacks only enqueue fixed-size events. All formatting and
+  // Serial/SdFat/QSPI logging is confined to this Arduino task.
+  deferred_logger::drain();
+
   uint32_t now = millis();
   leds_tick(now);
 
   if (s_state == State::kIdle) {
     bool eject_trig = s_storage_ok && usb_msc::was_ejected();
     if (eject_trig || s_armed_boot) {
+      if (eject_trig) {
+        // START_STOP_UNIT already made the LUN not-ready. Complete the
+        // exclusive handoff before any SdFat read, then reload the files the
+        // host just wrote during this same boot.
+        if (!usb_msc::claim_after_eject()) return;
+        bool cfg_loaded = config::load();
+        const config::Config& cfg = config::current();
+        ble_scanner::apply_runtime_settings(cfg.tx_power, cfg.scan_debug);
+        log_effective_config(cfg_loaded ? "CONFIG.TXT after eject" :
+                                         "defaults after eject");
+      }
       logger::log("dfu: trigger %s", eject_trig ? "eject" : "boot-no-vbus");
       s_armed_boot = false;
       s_state      = State::kRunning;

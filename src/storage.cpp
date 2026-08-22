@@ -1,6 +1,7 @@
 #include "storage.h"
 
 #include <Arduino.h>
+#include <nrf_gpio.h>
 #include <nrfx_qspi.h>
 
 namespace storage {
@@ -8,9 +9,11 @@ namespace storage {
 static Adafruit_FlashTransport_QSPI s_transport;
 static Adafruit_SPIFlash            s_flash(&s_transport);
 static FatVolume                    s_fatfs;
+static bool                         s_ready = false;
 
 Adafruit_SPIFlash& flash() { return s_flash; }
 FatVolume&         fs()    { return s_fatfs; }
+bool               ready() { return s_ready; }
 
 // Board-specific QSPI pinout + drive label. XIAO routes its on-board Puya
 // P25Q16H to a fixed P0 set; RAK4631 brings the SoC QSPI out to WisBlock
@@ -33,6 +36,66 @@ FatVolume&         fs()    { return s_fatfs; }
   static constexpr const char kVolLabel[12] = "XIAO DFU   ";
 #endif
 
+// A prior application or bootloader may leave the NOR in deep power-down.
+// nRF52840 TASKS_ACTIVATE communicates with the flash before custom
+// instructions are available, so wake it with a short mode-0 GPIO transaction
+// before the transport owns these pins.
+static void wake_flash_before_qspi_activate() {
+  nrf_gpio_pin_clear(kQspiSck);
+  nrf_gpio_pin_set(kQspiCsn);
+  nrf_gpio_pin_set(kQspiIo0);
+  nrf_gpio_pin_set(kQspiIo2);
+  nrf_gpio_pin_set(kQspiIo3);
+
+  nrf_gpio_cfg(kQspiSck, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiCsn, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo0, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo1, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo2, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo3, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+
+  delayMicroseconds(1);
+  nrf_gpio_pin_clear(kQspiCsn);
+  delayMicroseconds(1);
+  constexpr uint8_t kReleaseFromDeepPowerDown = 0xAB;
+  for (uint8_t bit = 0; bit < 8; bit++) {
+    nrf_gpio_pin_write(kQspiIo0,
+                       (kReleaseFromDeepPowerDown >> (7u - bit)) & 1u);
+    delayMicroseconds(1);
+    nrf_gpio_pin_set(kQspiSck);
+    delayMicroseconds(1);
+    nrf_gpio_pin_clear(kQspiSck);
+    delayMicroseconds(1);
+  }
+  nrf_gpio_pin_set(kQspiCsn);
+  delayMicroseconds(50);
+
+  // Match Nordic's QSPI pin handoff: leave safe output latch values, then
+  // release all pads before TASKS_ACTIVATE takes ownership. In particular,
+  // IO2/IO3 must not remain GPIO outputs when the transport switches to quad
+  // reads and writes.
+  nrf_gpio_pin_clear(kQspiSck);
+  nrf_gpio_pin_set(kQspiCsn);
+  nrf_gpio_cfg(kQspiSck, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiCsn, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo0, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo1, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo2, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+  nrf_gpio_cfg(kQspiIo3, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+               NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+}
+
 // SdFat's FatFormatter rejects volumes <= 6 MB because it's built for SD cards.
 // We need to format a 2 MB QSPI flash, so we write a minimal FAT12 image
 // directly. Layout (all values are 512 B sectors):
@@ -51,6 +114,8 @@ FatVolume&         fs()    { return s_fatfs; }
 // Each cluster is 4 KB, identical to the flash erase block, so user file
 // writes align naturally with the wear layout.
 static bool format_flash() {
+  static constexpr uint32_t kChipEraseTimeoutMs = 120000;
+
   Serial.println("storage: erasing chip...");
   uint32_t t0 = millis();
   if (!s_flash.eraseChip()) {
@@ -59,6 +124,10 @@ static bool format_flash() {
   }
   // eraseChip is async on the flash; wait for it to finish.
   while (s_flash.readStatus() & 0x01) {
+    if ((uint32_t)(millis() - t0) >= kChipEraseTimeoutMs) {
+      Serial.println("storage: chip erase timed out");
+      return false;
+    }
     delay(1);
   }
   Serial.print("storage: chip erased in "); Serial.print(millis() - t0); Serial.println(" ms");
@@ -102,7 +171,10 @@ static bool format_flash() {
     if (!s_flash.writeBlocks(5 + i, sec, 1)) return false;
   }
 
-  s_flash.syncBlocks();
+  if (!s_flash.syncBlocks()) {
+    Serial.println("storage: sync after format failed");
+    return false;
+  }
   Serial.println("storage: FAT12 image written");
   return true;
 }
@@ -122,6 +194,9 @@ static bool layout_is_current() {
 }
 
 bool begin() {
+  s_ready = false;
+  wake_flash_before_qspi_activate();
+
   // ---------- low-level QSPI bring-up (bypasses Adafruit transport) ----------
   // We control nrfx_qspi directly so failures are visible. The Adafruit
   // transport ignores all return codes.
@@ -150,12 +225,18 @@ bool begin() {
     return false;
   }
 
-  // Wake the chip from deep power-down (Seeed bootloader leaves it asleep).
+  // Repeat the release command through QSPI now that the peripheral owns the
+  // pins; this covers parts which ignored the pre-activation GPIO command.
   {
     nrf_qspi_cinstr_conf_t c = {};
     c.opcode = 0xAB; c.length = NRF_QSPI_CINSTR_LEN_1B;
     c.io2_level = true; c.io3_level = true;
-    nrfx_qspi_cinstr_xfer(&c, NULL, NULL);
+    err = nrfx_qspi_cinstr_xfer(&c, NULL, NULL);
+    if (err != NRFX_SUCCESS) {
+      Serial.print("storage: QSPI wake failed -> 0x"); Serial.println(err, HEX);
+      nrfx_qspi_uninit();
+      return false;
+    }
   }
   delayMicroseconds(50);
 
@@ -165,26 +246,48 @@ bool begin() {
     nrf_qspi_cinstr_conf_t c = {};
     c.opcode = 0x9F; c.length = NRF_QSPI_CINSTR_LEN_4B;
     c.io2_level = true; c.io3_level = true;
-    nrfx_qspi_cinstr_xfer(&c, NULL, jedec);
+    err = nrfx_qspi_cinstr_xfer(&c, NULL, jedec);
+    if (err != NRFX_SUCCESS) {
+      Serial.print("storage: direct JEDEC read failed -> 0x"); Serial.println(err, HEX);
+      nrfx_qspi_uninit();
+      return false;
+    }
     Serial.print("storage: direct JEDEC = ");
     for (int i = 0; i < 3; i++) {
       if (jedec[i] < 0x10) Serial.print('0');
       Serial.print(jedec[i], HEX); Serial.print(' ');
     }
     Serial.println();
+
+    bool all_zero = jedec[0] == 0 && jedec[1] == 0 && jedec[2] == 0;
+    bool all_ff = jedec[0] == 0xFF && jedec[1] == 0xFF && jedec[2] == 0xFF;
+    if (all_zero || all_ff) {
+      Serial.println("storage: invalid direct JEDEC response");
+      nrfx_qspi_uninit();
+      return false;
+    }
   }
+
+  // Adafruit_SPIFlash::begin() initializes its transport. Relinquish the
+  // diagnostic instance first so that second initialization is real rather
+  // than a silently ignored NRFX_ERROR_INVALID_STATE.
+  nrfx_qspi_uninit();
 
   // Hand off to Adafruit_SPIFlash for filesystem-level access. The library's
   // default device table is too narrow and rejects valid JEDEC IDs we care
   // about (Puya P25Q16H on the XIAO; GigaDevice GD25Q16 wired into RAK
   // Slot A), so we pass the device descriptor explicitly per board.
 #if defined(BOARD_RAK4631)
-  static const SPIFlash_Device_t s_flash_dev = GD25Q16C;
+  static const SPIFlash_Device_t s_flash_devs[] = { GD25Q16C };
 #else
-  static const SPIFlash_Device_t s_flash_dev = P25Q16H;
+  static const SPIFlash_Device_t s_flash_devs[] = {
+    P25Q16H, GD25Q16C, W25Q16FW, W25Q16JV_IQ, W25Q16JV_IM,
+    MX25L1606, MX25R1635F, ZD25WQ16B
+  };
 #endif
-  if (!s_flash.begin(&s_flash_dev, 1)) {
+  if (!s_flash.begin(s_flash_devs, sizeof(s_flash_devs) / sizeof(s_flash_devs[0]))) {
     Serial.println("storage: flash.begin() failed (no JEDEC match?)");
+    s_flash.end();
     return false;
   }
 
@@ -201,13 +304,18 @@ bool begin() {
   }
 
   if (need_format) {
-    if (!format_flash()) return false;
+    if (!format_flash()) {
+      s_flash.end();
+      return false;
+    }
     if (!s_fatfs.begin(&s_flash)) {
       Serial.println("storage: fatfs.begin() FAILED after format");
+      s_flash.end();
       return false;
     }
   }
 
+  s_ready = true;
   Serial.println("storage: filesystem mounted");
   return true;
 }
@@ -216,7 +324,7 @@ static bool ends_with_zip(const char* name) {
   size_t n = strlen(name);
   if (n < 4) return false;
   const char* ext = name + n - 4;
-  return (ext[0] == '.' || ext[0] == '.') &&
+  return ext[0] == '.' &&
          (ext[1] == 'z' || ext[1] == 'Z') &&
          (ext[2] == 'i' || ext[2] == 'I') &&
          (ext[3] == 'p' || ext[3] == 'P');

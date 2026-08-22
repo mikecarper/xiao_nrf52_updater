@@ -26,11 +26,10 @@ retries=10
 # settle after a reset before it'll accept another START_DFU.
 retry_cooldown=5
 
-# Seconds to wait after a *post-connect* failure (response timeout, protocol
-# error, link drop mid-stream). SDK 11-era bootloaders (stock Adafruit /
-# RAK4631) that wedge mid-DFU only unstick when their internal inactivity
-# watchdog fires — usually 60-120 s. Pre-connect failures still use the short
-# retry_cooldown above.
+# Seconds to wait only if RESET was not observed and the session ended with a
+# lost/forced link. Legacy bootloaders may keep partial DFU state until their
+# inactivity watchdog fires. Clean RESET and pre-connect failures use the
+# short retry_cooldown above.
 wedge_cooldown=60
 
 # Minimum RSSI (dBm, negative). Ads weaker than this are rejected during
@@ -40,6 +39,6 @@ min_rssi=-70
 
 # BLE TX power in dBm. nRF52840 allowed values:
 #   -40, -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 7, 8
-# Default 0. Crank to 8 for max range; anything not in the list is
-# silently rejected and the SoftDevice keeps the previous level.
+# Default 4. Crank to 8 for max range; an unsupported value falls back to
+# 0 dBm.
 tx_power=8

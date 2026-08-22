@@ -35,10 +35,10 @@ void log(const char* fmt, ...) {
   // Always mirror to Serial — even when the FS write fails.
   Serial.write((const uint8_t*)line, total);
 
-  // Skip the file write while the host has the drive mounted: SdFat and the
-  // host can't safely share the FAT cache, and a write from our side would
-  // race with the host's view. We still keep the Serial mirror.
-  if (usb_msc::is_mounted()) return;
+  // A block host and SdFat must never share the volume. File logging starts
+  // only after the one-shot eject handoff (or on a battery-triggered boot
+  // where MSC was never exposed).
+  if (!storage::ready() || !usb_msc::firmware_owns_media()) return;
 
   File f = storage::fs().open(kLogPath, O_WRONLY | O_CREAT | O_APPEND);
   if (!f) return;

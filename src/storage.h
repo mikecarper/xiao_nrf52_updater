@@ -6,6 +6,7 @@
 namespace storage {
 
 bool begin();
+bool ready();
 
 Adafruit_SPIFlash& flash();
 FatVolume&         fs();

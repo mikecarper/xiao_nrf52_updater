@@ -31,6 +31,11 @@
 *.bin
 *.map
 
+# Python cache / test state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Runtime artifacts (in case anyone ever copies them off the QSPI drive)
 LOG.TXT
 

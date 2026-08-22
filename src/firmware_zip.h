@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+#include "dfu_image_layout.h"
 #include "zip_reader.h"
 
 namespace firmware_zip {
@@ -10,17 +11,18 @@ namespace firmware_zip {
 // byte (see LegacyDfuImpl.java). When more than one is set, the firmware is
 // a combined image.
 enum FwType : uint8_t {
-  TYPE_SOFTDEVICE = 0x01,
-  TYPE_BOOTLOADER = 0x02,
-  TYPE_APPLICATION = 0x04,
+  TYPE_SOFTDEVICE = dfu_image_layout::kTypeSoftdevice,
+  TYPE_BOOTLOADER = dfu_image_layout::kTypeBootloader,
+  TYPE_APPLICATION = dfu_image_layout::kTypeApplication,
 };
 
 struct Parsed {
   uint8_t            type;        // bitmask of FwType
   zip_reader::Entry  bin;         // firmware image (concatenated for SD+BL)
   zip_reader::Entry  dat;         // init packet
-  uint32_t           sd_size;     // only set for SD+BL bundles
-  uint32_t           bl_size;     // only set for SD+BL bundles
+  uint32_t           sd_size;     // Legacy DFU size tuple, SoftDevice field
+  uint32_t           bl_size;     // Legacy DFU size tuple, Bootloader field
+  uint32_t           app_size;    // Legacy DFU size tuple, Application field
 };
 
 // Open the zip at `zip_path`, parse manifest.json, and resolve the bin/dat

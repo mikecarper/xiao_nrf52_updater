@@ -1,15 +1,33 @@
 name: Build & Release
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
+    branches:
+      - '**'
     tags:
       - 'v*'
 
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install host test dependency
+        run: pip install pyserial==3.5
+      - name: Run host tests
+        run: |
+          bash tests/run_host_tests.sh
+          SANITIZE=1 bash tests/run_host_tests.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests/test_v4_serial_upload.py
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -32,7 +50,7 @@ jobs:
           key: ${{ runner.os }}-pio
 
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        run: pip install platformio==6.1.18
 
       - name: Build firmware (${{ matrix.env }})
         run: pio run -e ${{ matrix.env }}
@@ -67,10 +85,51 @@ jobs:
           name: firmware-${{ matrix.env }}
           path: out/*
 
+  build-heltec-v4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-v4
+      - name: Install PlatformIO
+        run: pip install platformio==6.1.18
+      - name: Build Heltec V4 app image
+        run: pio run -e heltec_v4
+      - name: Stage app-only artifact
+        run: |
+          mkdir -p out
+          cp .pio/build/heltec_v4/firmware.bin out/heltec-v4-app.bin
+          cp .pio/build/heltec_v4/firmware.elf out/heltec-v4-app.elf
+          sha256sum out/heltec-v4-app.bin out/heltec-v4-app.elf > out/SHA256SUMS
+      - name: Upload Heltec V4 app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-heltec-v4-app-only
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [tests, build, build-heltec-v4]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
       - name: Create draft release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           draft: true
-          files: out/*
+          files: release/*

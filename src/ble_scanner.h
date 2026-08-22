@@ -19,6 +19,10 @@ struct Target {
 // and the default (0 dBm) stays in effect.
 void begin(int8_t tx_power_dbm = 0);
 
+// Reapply settings that CONFIG.TXT may change during the host-copy/eject
+// workflow. Safe after begin() and before scanning.
+void apply_runtime_settings(int8_t tx_power_dbm, bool debug);
+
 // When true, every rejected advertisement is logged (with reason and MAC).
 // Off by default — turn on to diagnose "target isn't being picked up".
 void set_debug(bool on);

@@ -1,6 +1,6 @@
 #include "ble_scanner.h"
 
-#include "logger.h"
+#include "deferred_logger.h"
 
 namespace ble_scanner {
 
@@ -20,6 +20,14 @@ static const ble_gap_addr_t* s_target_mac  = nullptr;   // strict CONFIG.TXT ble
 static bool                  s_debug       = false;     // verbose per-ad log
 
 void set_debug(bool on) { s_debug = on; }
+
+void apply_runtime_settings(int8_t tx_power_dbm, bool debug) {
+  // setTxPower() returns false for values outside the discrete nRF52840 list.
+  // Use a known-safe fallback instead of silently retaining stale settings
+  // from the CONFIG.TXT that was present at boot.
+  if (!Bluefruit.setTxPower(tx_power_dbm)) Bluefruit.setTxPower(0);
+  set_debug(debug);
+}
 
 // Pipe-delimited substring match: returns true if `name` contains any of
 // the '|'-separated tokens in `filter` (after trimming each). Empty tokens
@@ -80,12 +88,11 @@ static void log_seen(const ble_gap_evt_adv_report_t* report, const char* name,
     seen_count++;
   }
 
-  logger::log("scan: %s %02X:%02X:%02X:%02X:%02X:%02X rssi=%d name='%s'",
-              reason,
-              report->peer_addr.addr[5], report->peer_addr.addr[4],
-              report->peer_addr.addr[3], report->peer_addr.addr[2],
-              report->peer_addr.addr[1], report->peer_addr.addr[0],
-              report->rssi, name);
+  // Bluefruit invokes scan_cb() on its Callback FreeRTOS task. Copy the event
+  // now and let find_first() format/write it on the Arduino task; SdFat and
+  // Adafruit_SPIFlash are not safe to use concurrently with bundle reads.
+  deferred_logger::post_scan_rejected(report->peer_addr.addr, report->rssi,
+                                      name, reason);
 }
 
 static void scan_cb(ble_gap_evt_adv_report_t* report) {
@@ -188,11 +195,8 @@ void begin(int8_t tx_power_dbm) {
   Bluefruit.setName("XIAO DFU updater");
 
   // TX power. Allowed values on nRF52840: -40, -20, -16, -12, -8, -4, 0,
-  // 2, 3, 4, 5, 6, 7, 8 (max). setTxPower() returns false and leaves the
-  // previous (default 0 dBm) value if the requested level isn't in the list.
-  if (!Bluefruit.setTxPower(tx_power_dbm)) {
-    Bluefruit.setTxPower(0);
-  }
+  // 2, 3, 4, 5, 6, 7, 8 (max).
+  apply_runtime_settings(tx_power_dbm, s_debug);
 
   Bluefruit.Scanner.setRxCallback(scan_cb);
   Bluefruit.Scanner.restartOnDisconnect(false);
@@ -215,11 +219,13 @@ bool find_first(Target* out, uint32_t timeout_ms, const char* name_filter,
   // the deadline.
   uint32_t deadline = millis() + timeout_ms;
   while (!s_found) {
+    deferred_logger::drain();
     if (timeout_ms != 0 && (int32_t)(deadline - millis()) <= 0) break;
     delay(50);
   }
 
   Bluefruit.Scanner.stop();
+  deferred_logger::drain();
 
   if (!s_found) return false;
   *out = s_match;

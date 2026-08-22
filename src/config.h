@@ -28,7 +28,7 @@ struct Config {
   uint8_t  retries;
 
   // Minimum RSSI (dBm, negative) we'll accept from a target. Ads weaker than
-  // this are ignored during the scan phase. Default -127 = no minimum.
+  // this are ignored during the scan phase. Default -90; -127 = no minimum.
   // Useful when this rig is mounted on a drone and we want to refuse flashing
   // a peer that's too far / signal too weak to reliably stream to.
   int8_t   min_rssi;
@@ -38,17 +38,14 @@ struct Config {
   // and slamming retries returns INVALID_STATE.
   uint16_t retry_cooldown;
 
-  // Extended cooldown used after a *post-connect* failure (response timeout,
-  // protocol error, link drop mid-stream). SDK 11-era bootloaders that wedge
-  // mid-DFU only unstick when their internal inactivity watchdog fires —
-  // usually 60–120 s. Pre-connect failures (weak signal, link never came up)
-  // still use the short `retry_cooldown`; only failures past the GATT handshake
-  // use this one.
+  // Extended cooldown used only when a connected session could not be cleaned
+  // with RESET and its link was lost/forced down. Legacy bootloaders may then
+  // retain partial state until their inactivity watchdog fires.
   uint16_t wedge_cooldown;
 
   // BLE transmit power in dBm. nRF52840 valid values:
   //   -40, -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 7, 8
-  // Default 0. Crank to 8 for max range (drone use); SoftDevice will reject
+  // Default 4. Crank to 8 for max range (drone use); SoftDevice will reject
   // anything not in the allowed list and we fall back to 0.
   int8_t   tx_power;
 
@@ -64,7 +61,7 @@ struct Config {
 };
 
 // Set the working config from defaults, then overlay anything found in
-// /CONFIG.TXT on the drive. Always succeeds; missing file = defaults only.
+// /CONFIG.TXT on the drive. Missing/unavailable file = defaults only.
 // Returns true if CONFIG.TXT was loaded, false if defaults were used.
 bool load();
 
