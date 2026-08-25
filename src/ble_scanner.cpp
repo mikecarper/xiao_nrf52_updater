@@ -21,6 +21,12 @@ static bool                  s_debug       = false;     // verbose per-ad log
 
 void set_debug(bool on) { s_debug = on; }
 
+void set_tx_power(int8_t tx_power_dbm) {
+  if (!Bluefruit.setTxPower(tx_power_dbm)) {
+    Bluefruit.setTxPower(0);
+  }
+}
+
 // Pipe-delimited substring match: returns true if `name` contains any of
 // the '|'-separated tokens in `filter` (after trimming each). Empty tokens
 // are ignored. An empty/null filter returns false here; the caller treats
@@ -43,18 +49,25 @@ static bool name_matches(const char* name, const char* filter) {
   return false;
 }
 
-// True if `addr` equals `*ref` or `*ref + 1` (with carry across all 6 bytes).
-// Nordic Legacy DFU bootloaders that boot out of an app-mode firmware
-// typically advertise from a MAC that's one higher than the app's MAC.
-static bool mac_match_or_plus_one(const ble_gap_addr_t& addr, const ble_gap_addr_t* ref) {
+static bool mac_equal(const ble_gap_addr_t& addr, const ble_gap_addr_t* ref) {
+  return ref && memcmp(addr.addr, ref->addr, 6) == 0;
+}
+
+// True if `addr` equals `*ref + 1` (with carry across all 6 bytes). Nordic
+// Legacy DFU bootloaders commonly increment the application address.
+static bool mac_is_plus_one(const ble_gap_addr_t& addr, const ble_gap_addr_t* ref) {
   if (!ref) return false;
-  if (memcmp(addr.addr, ref->addr, 6) == 0) return true;
   ble_gap_addr_t plus_one = *ref;
   for (int i = 0; i < 6; i++) {
     plus_one.addr[i]++;
     if (plus_one.addr[i] != 0) break;   // no further carry needed
   }
   return memcmp(addr.addr, plus_one.addr, 6) == 0;
+}
+
+static bool mac_match_or_plus_one(const ble_gap_addr_t& addr,
+                                  const ble_gap_addr_t* ref) {
+  return mac_equal(addr, ref) || mac_is_plus_one(addr, ref);
 }
 
 // One-line summary of an ad. Caller passes the reason; we de-dupe per MAC so
@@ -108,6 +121,14 @@ static void scan_cb(ble_gap_evt_adv_report_t* report) {
   }
   candidate.name[sizeof(candidate.name) - 1] = '\0';
 
+  // Mode evidence carried into the connection phase. OTAFIX bootloaders put
+  // the Legacy DFU service UUID in their advertising data. MeshCore's
+  // application-side BLEDfu service intentionally advertises only its name,
+  // even though the same service becomes visible after connection.
+  BLEUuid legacy_dfu_uuid(kLegacyDfuUuid128);
+  candidate.advertises_legacy_dfu =
+    Bluefruit.Scanner.checkReportForUuid(report, legacy_dfu_uuid);
+
   // RSSI threshold.
   if (report->rssi < s_min_rssi) {
     log_seen(report, candidate.name, "weak");
@@ -134,8 +155,8 @@ static void scan_cb(ble_gap_evt_adv_report_t* report) {
   // Strict MAC mode from CONFIG.TXT.
   // This is intentionally before the old UUID fallback.
   if (!has_name && s_target_mac) {
-    bool target_mac_ok = mac_match_or_plus_one(report->peer_addr, s_target_mac);
-    bool prefer_mac_ok = mac_match_or_plus_one(report->peer_addr, s_prefer_mac);
+    bool const target_mac_ok = mac_match_or_plus_one(report->peer_addr, s_target_mac);
+    bool const prefer_mac_ok = mac_match_or_plus_one(report->peer_addr, s_prefer_mac);
 
     if (!(target_mac_ok || prefer_mac_ok)) {
       log_seen(report, candidate.name, "mac?");
@@ -143,6 +164,8 @@ static void scan_cb(ble_gap_evt_adv_report_t* report) {
       return;
     }
 
+    candidate.mac_plus_one = mac_is_plus_one(report->peer_addr, s_target_mac) ||
+                             mac_is_plus_one(report->peer_addr, s_prefer_mac);
     s_match = candidate;
     s_found = true;
     Bluefruit.Scanner.stop();
@@ -153,12 +176,7 @@ static void scan_cb(ble_gap_evt_adv_report_t* report) {
   bool mac_ok = mac_match_or_plus_one(report->peer_addr, s_prefer_mac);
   bool name_ok = has_name && name_matches(candidate.name, s_name_filter);
   bool need_uuid = !mac_ok && !has_name;
-  bool uuid_ok = false;
-
-  if (need_uuid) {
-    BLEUuid uuid(kLegacyDfuUuid128);
-    uuid_ok = Bluefruit.Scanner.checkReportForUuid(report, uuid);
-  }
+  bool uuid_ok = need_uuid && candidate.advertises_legacy_dfu;
 
   if (!(mac_ok || name_ok || uuid_ok)) {
     const char* reason = mac_ok ? "mac" : (has_name ? "name?" : "uuid?");
@@ -167,6 +185,7 @@ static void scan_cb(ble_gap_evt_adv_report_t* report) {
     return;
   }
 
+  candidate.mac_plus_one = mac_is_plus_one(report->peer_addr, s_prefer_mac);
   s_match  = candidate;
   s_found  = true;
   Bluefruit.Scanner.stop();
@@ -183,16 +202,14 @@ void begin(int8_t tx_power_dbm) {
   // These are applied to the central role; we don't run as peripheral.
   Bluefruit.configCentralConn(247, 6, 2, 4);
 
-  // 0 peripheral, 1 central — we're a pure DFU client.
+  // 0 peripheral, 1 central - we're a pure DFU client.
   Bluefruit.begin(0, 1);
   Bluefruit.setName("XIAO DFU updater");
 
   // TX power. Allowed values on nRF52840: -40, -20, -16, -12, -8, -4, 0,
   // 2, 3, 4, 5, 6, 7, 8 (max). setTxPower() returns false and leaves the
   // previous (default 0 dBm) value if the requested level isn't in the list.
-  if (!Bluefruit.setTxPower(tx_power_dbm)) {
-    Bluefruit.setTxPower(0);
-  }
+  set_tx_power(tx_power_dbm);
 
   Bluefruit.Scanner.setRxCallback(scan_cb);
   Bluefruit.Scanner.restartOnDisconnect(false);

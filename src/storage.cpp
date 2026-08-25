@@ -12,6 +12,21 @@ static FatVolume                    s_fatfs;
 Adafruit_SPIFlash& flash() { return s_flash; }
 FatVolume&         fs()    { return s_fatfs; }
 
+bool prepare_for_host_access() {
+  // Order matters: cacheClear() may write a dirty SdFat sector into the flash
+  // library's 4 KiB erase cache. Flush that erase cache only afterwards.
+  if (s_fatfs.cacheClear() == nullptr) return false;
+  return s_flash.syncBlocks();
+}
+
+void refresh_after_host_write() {
+  // Raw MSC writes land in the flash library's erase cache. Commit those
+  // first, then discard the now-stale (and, by ownership contract, clean)
+  // SdFat sector cache before opening files from firmware.
+  s_flash.syncBlocks();
+  s_fatfs.cacheClear();
+}
+
 // Board-specific QSPI pinout + drive label. XIAO routes its on-board Puya
 // P25Q16H to a fixed P0 set; RAK4631 brings the SoC QSPI out to WisBlock
 // Slot A where the user wires their own GD25Q16.
@@ -216,7 +231,7 @@ static bool ends_with_zip(const char* name) {
   size_t n = strlen(name);
   if (n < 4) return false;
   const char* ext = name + n - 4;
-  return (ext[0] == '.' || ext[0] == '.') &&
+  return ext[0] == '.' &&
          (ext[1] == 'z' || ext[1] == 'Z') &&
          (ext[2] == 'i' || ext[2] == 'I') &&
          (ext[3] == 'p' || ext[3] == 'P');
@@ -233,7 +248,7 @@ int find_single_zip(char* out, size_t out_len) {
       char name[64];
       f.getName(name, sizeof(name));
       // Skip macOS metadata siblings (`._foo.zip`) and any other dot-prefixed
-      // files — Finder writes these on FAT volumes to hold extended attrs.
+      // files - Finder writes these on FAT volumes to hold extended attrs.
       if (name[0] != '.' && ends_with_zip(name)) {
         if (count == 0 && out_len > 0) {
           snprintf(out, out_len, "%s", name);

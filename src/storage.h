@@ -10,6 +10,16 @@ bool begin();
 Adafruit_SPIFlash& flash();
 FatVolume&         fs();
 
+// Flush firmware-side filesystem state before a USB host is allowed to access
+// the same flash as a raw block device.
+bool prepare_for_host_access();
+
+// Finish raw MSC writes and invalidate SdFat's cached FAT/root-directory
+// sectors before firmware-side file access. The USB host and SdFat use the
+// same flash through different paths, so an eject alone does not make an old
+// in-RAM directory cache coherent.
+void refresh_after_host_write();
+
 // Scan the FAT root directory for exactly one `*.zip` file (case-insensitive).
 // On success copies the 8.3 / long filename into `out` and returns the count
 // of zips found. The caller should treat a return value other than 1 as an

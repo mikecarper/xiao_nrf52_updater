@@ -19,8 +19,8 @@ struct Parsed {
   uint8_t            type;        // bitmask of FwType
   zip_reader::Entry  bin;         // firmware image (concatenated for SD+BL)
   zip_reader::Entry  dat;         // init packet
-  uint32_t           sd_size;     // only set for SD+BL bundles
-  uint32_t           bl_size;     // only set for SD+BL bundles
+  uint32_t           sd_size;     // set for SD-only and SD+BL bundles
+  uint32_t           bl_size;     // set for BL-only and SD+BL bundles
 };
 
 // Open the zip at `zip_path`, parse manifest.json, and resolve the bin/dat

@@ -9,6 +9,8 @@ struct Target {
   ble_gap_addr_t addr;        // 48-bit MAC + type, ready to pass to Central.connect()
   int8_t         rssi;
   char           name[24];    // empty string if device didn't advertise a name
+  bool           advertises_legacy_dfu;
+  bool           mac_plus_one;
 };
 
 // Initialize the BLE central stack. Must be called once before scan() and the
@@ -19,8 +21,11 @@ struct Target {
 // and the default (0 dBm) stays in effect.
 void begin(int8_t tx_power_dbm = 0);
 
+// Apply a new TX-power setting after CONFIG.TXT is reloaded on eject.
+void set_tx_power(int8_t tx_power_dbm);
+
 // When true, every rejected advertisement is logged (with reason and MAC).
-// Off by default — turn on to diagnose "target isn't being picked up".
+// Off by default - turn on to diagnose "target isn't being picked up".
 void set_debug(bool on);
 
 // Scan for any device advertising the Nordic Legacy DFU service UUID
@@ -30,7 +35,7 @@ void set_debug(bool on);
 // `name_filter`, when non-empty, is matched as a substring against the
 // advertised Complete / Short Local Name. The filter can hold multiple
 // substrings separated by '|' (with optional surrounding whitespace), and
-// any one matching accepts the ad — useful when an app and its bootloader
+// any one matching accepts the ad - useful when an app and its bootloader
 // advertise under different names.
 //
 // `min_rssi` rejects ads weaker than the threshold (in dBm, negative). Pass
@@ -38,8 +43,8 @@ void set_debug(bool on);
 //
 // `prefer_mac`, when non-null, makes the scanner additionally accept ads
 // whose MAC equals `*prefer_mac` or `*prefer_mac + 1` (Nordic convention
-// for the app→bootloader transition). The name filter still applies on top
-// — matching either side accepts the ad. Used right after a buttonless
+// for the app-to-bootloader transition). The name filter still applies on top
+// - matching either side accepts the ad. Used right after a buttonless
 // trigger so we don't lose the target when the bootloader advertises under
 // a different name.
 bool find_first(Target* out, uint32_t timeout_ms,

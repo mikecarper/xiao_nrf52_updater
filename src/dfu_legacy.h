@@ -9,7 +9,7 @@
 namespace dfu_legacy {
 
 // Invoked from inside run() during the firmware stream. `pct` is 0..100.
-// Called frequently — keep the body fast and avoid blocking I/O.
+// Called frequently - keep the body fast and avoid blocking I/O.
 typedef void (*ProgressCb)(uint8_t pct);
 
 void set_progress_callback(ProgressCb cb);
@@ -21,6 +21,7 @@ enum class Result {
   kConnectFailed,
   kServiceMissing,
   kCharMissing,
+  kRevisionUnreadable,
   kDisconnectedEarly,
   kTimeout,
   kRemoteError,

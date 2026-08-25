@@ -28,6 +28,12 @@ Intended use: a drone-mounted OTA flasher that updates a hard to reach nRF52 rep
 5. The XIAO scans for a target advertising the Legacy DFU service, matching the configured BLE name, or matching the configured BLE MAC address. It optionally sends the buttonless trigger to kick the target from app mode into bootloader, then runs the full DFU sequence.
 6. On success the `.zip` is deleted from the drive; the `LOG.TXT` keeps the history.
 
+Eject is the commit boundary: the updater makes its MSC LUN unavailable,
+flushes raw flash writes, and invalidates its FAT cache before looking for the
+ZIP. It also reloads `CONFIG.TXT` and reapplies TX power and scan diagnostics.
+A package or configuration copied after the updater boot therefore does not
+require an extra reboot or repeated eject attempts.
+
 ## Triggers
 
 Two ways to start a DFU sequence:
@@ -63,7 +69,7 @@ ble_mac=
 # peer's RX queue.
 prn=10
 
-# Negotiate MTU 247 after connect (5–10x faster stream).
+# Negotiate MTU 247 after connect (5-10x faster stream).
 # Some older bootloaders ignore the request and we fall back to 20 B writes.
 high_mtu=1
 
@@ -77,7 +83,7 @@ retry_cooldown=5
 # Seconds to wait after a *post-connect* failure (response timeout,
 # protocol error, link drop mid-stream). SDK 11-era bootloaders (stock
 # Adafruit / RAK4631) that wedge mid-DFU only unstick when their internal
-# inactivity watchdog fires — usually 60-120 s. Pre-connect failures still
+# inactivity watchdog fires - usually 60-120 s. Pre-connect failures still
 # use the short retry_cooldown above.
 wedge_cooldown=60
 
@@ -121,7 +127,7 @@ XIAO has 3 LEDs (R/G/B, active-low). RAK4631 has 2 (green + blue, active-high) a
 |---|---|---|
 | Idle, no host | BLUE slow blink (~1 Hz) | BLUE slow blink (~1 Hz) |
 | Host has the drive mounted | BLUE solid | BLUE solid |
-| DFU running, streaming | GREEN blink, period shrinks 0%→95% | same |
+| DFU running, streaming | GREEN blink, period shrinks 0%-95% | same |
 | DFU succeeded | GREEN solid | GREEN solid |
 | DFU failed (after retries) | RED solid | GREEN+BLUE alternating ~4 Hz |
 
@@ -131,13 +137,13 @@ The progress LED is driven from inside the DFU stream loop (the main loop is blo
 
 Lines are `[hh:mm:ss] message`. Timestamps are boot-relative - there's no RTC.
 
-The log is mirrored to both Serial (USB CDC) and to `LOG.TXT` on the drive. **The file write is skipped while the host has the drive mounted** - SdFat and the host can't safely share the FAT cache, so we wait until the drive is ejected to flush. Serial output is always live.
+The log is mirrored to both Serial (USB CDC) and to `LOG.TXT` on the drive. **The file write is skipped for the host's full media-ownership interval, starting as soon as USB VBUS is detected** - SdFat and raw USB block access can't safely share the FAT cache. Serial output is always live; file logging resumes after eject.
 
 | Drive state | Serial | LOG.TXT |
 |---|---|---|
-| Mounted on host | ✓ | skipped |
-| Ejected (USB still plugged) | ✓ | ✓ |
-| USB unplugged | nothing reads it | ✓ |
+| Mounted on host | yes | skipped |
+| Ejected (USB still plugged) | yes | yes |
+| USB unplugged | nothing reads it | yes |
 
 Useful scan/debug lines when `ble_mac` is configured:
 
@@ -160,7 +166,7 @@ When `scan_debug=1`, advertisements rejected because they do not match the confi
 
 ZIPs must use `STORE` (no compression). This is what `nrfutil pkg generate` produces by default.
 
-The `.zip` is validated by parsing `manifest.json` and locating the `.bin` + `.dat` referenced inside. The `.dat` (init packet) is required for any peer reporting DFU version ≥ 0.5.
+The `.zip` is validated by parsing `manifest.json` and locating the `.bin` + `.dat` referenced inside. The `.dat` (init packet) is required for any peer reporting DFU version >= 0.5.
 
 ## Build & flash
 
@@ -185,7 +191,7 @@ pio device monitor                        # 115200 baud, watches serial
 
 Requirements: PlatformIO with the upstream `nordicnrf52` platform. The project's `platformio.ini` pins the BSP to a meshcore-dev fork of `framework-arduinoadafruitnrf52` (BLE stack patches). Board JSONs and linker script are vendored under `boards/`. Variants under `variants/xiao_nrf52/` and `variants/rak4631/`.
 
-No bootloader replacement is required on either board — the factory UF2 bootloader works.
+No bootloader replacement is required on either board - the factory UF2 bootloader works.
 
 ## Project layout
 

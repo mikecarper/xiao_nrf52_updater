@@ -37,7 +37,7 @@ static void leds_off() {
 // ---------------------------------------------------------------------------
 // Boot conditions
 // ---------------------------------------------------------------------------
-// VBUS detect — bit set when USB is supplying power. If absent, the board is
+// VBUS detect - bit set when USB is supplying power. If absent, the board is
 // running off the BAT+/BAT- pads and we should treat any zip on the drive as
 // "ready to flash immediately", matching the requirements' physical-unplug
 // trigger.
@@ -51,8 +51,8 @@ static bool vbus_present() {
 enum class State : uint8_t {
   kIdle,          // waiting for trigger
   kRunning,       // DFU sequence in progress (we block in here)
-  kDoneOk,        // success — green solid
-  kDoneFail,      // failed after retries — red solid
+  kDoneOk,        // success - green solid
+  kDoneFail,      // failed after retries - red solid
 };
 
 static State                  s_state     = State::kIdle;
@@ -71,7 +71,7 @@ static void on_dfu_progress(uint8_t pct) {
 // Scan for a target advertising the Legacy DFU service (or matching the
 // configured ble_name). Returns true once found, false only when an explicit
 // scan_timeout was configured and exceeded. With the default cfg.scan_timeout=0
-// this blocks indefinitely — appropriate for drone use where the target may
+// this blocks indefinitely - appropriate for drone use where the target may
 // take minutes to come into range.
 //
 // `prefer_mac` is non-null right after a buttonless trigger: it makes the
@@ -106,16 +106,17 @@ static bool scan_for_target(ble_scanner::Target* out,
     logger::log("scan: timed out, no target found");
     return false;
   }
-  logger::log("scan: found %02X:%02X:%02X:%02X:%02X:%02X  rssi=%d  '%s'",
+  logger::log("scan: found %02X:%02X:%02X:%02X:%02X:%02X  rssi=%d  dfu_uuid=%d mac_plus_one=%d  '%s'",
               out->addr.addr[5], out->addr.addr[4], out->addr.addr[3],
               out->addr.addr[2], out->addr.addr[1], out->addr.addr[0],
-              out->rssi, out->name);
+              out->rssi, (int)out->advertises_legacy_dfu,
+              (int)out->mac_plus_one, out->name);
   return true;
 }
 
 // Full sequence: parse zip, scan (forever by default), then up to `retries`
 // DFU attempts against the discovered target. Scan failures do NOT consume
-// a retry — only post-scan DFU failures do. Buttonless triggers also don't
+// a retry - only post-scan DFU failures do. Buttonless triggers also don't
 // consume retries: we just rescan after the peer reboots.
 static void run_dfu_sequence() {
   char zip_name[64];
@@ -149,11 +150,12 @@ static void run_dfu_sequence() {
   uint8_t        dfu_attempt    = 0;
 
   // After a buttonless trigger we remember the app-mode MAC and pass it into
-  // the next scan so the scanner also accepts MAC / MAC+1 hits — covers
+  // the next scan so the scanner also accepts MAC / MAC+1 hits - covers
   // bootloaders that re-advertise under a different name (e.g. RAK4631_OTA
-  // → 4631_DFU). Cleared once we get a non-buttonless result.
+  // -> 4631_DFU). Cleared once we get a non-buttonless result.
   ble_gap_addr_t pending_app_mac      = {};
   bool           have_pending_app_mac = false;
+  uint8_t        buttonless_triggers  = 0;
 
   while (dfu_attempt < retries) {
     ble_scanner::Target t;
@@ -167,6 +169,13 @@ static void run_dfu_sequence() {
     dfu_legacy::Result r = dfu_legacy::run(t, s_bundle, cfg);
 
     if (r == dfu_legacy::Result::kButtonlessTriggered) {
+      buttonless_triggers++;
+      if (buttonless_triggers > 2) {
+        logger::log("dfu: buttonless transition repeated without reaching bootloader");
+        s_state = State::kDoneFail;
+        zip_reader::close();
+        return;
+      }
       logger::log("dfu: buttonless triggered, waiting 2 s for peer reboot...");
       pending_app_mac      = t.addr;
       have_pending_app_mac = true;
@@ -193,7 +202,7 @@ static void run_dfu_sequence() {
                 dfu_attempt, retries, (int)r);
     if (dfu_attempt < retries) {
       // Classify the failure to pick a cooldown. Pre-connect failures
-      // (link never came up, dropped during setup) — short cooldown, the
+      // (link never came up, dropped during setup) - short cooldown, the
       // peer is fine, we just need to rescan. Post-connect failures
       // (service/char missing, response timeout, protocol error, mid-stream
       // drop) suggest the bootloader's DFU state machine is wedged from a
@@ -223,7 +232,7 @@ static void leds_tick(uint32_t now) {
 
   // Helper to clear the red LED on boards that have one. On RAK4631 LED_RED
   // is aliased to LED_GREEN, so calling led_set(LED_RED, ...) would clobber
-  // the green channel — guard it instead.
+  // the green channel - guard it instead.
 #if defined(BOARD_RAK4631)
   #define LED_RED_SET(on) ((void)0)
 #else
@@ -269,7 +278,7 @@ static void leds_tick(uint32_t now) {
       break;
     case State::kDoneFail:
 #if defined(BOARD_RAK4631)
-      // No red LED — alternate green/blue at ~4 Hz so the failure state is
+      // No red LED - alternate green/blue at ~4 Hz so the failure state is
       // unmistakable.
       if (now - last >= 125) { last = now; phase = !phase; }
       led_set(LED_GREEN, phase);
@@ -294,13 +303,20 @@ void setup() {
   bool vbus = vbus_present();
 
   s_storage_ok = storage::begin();
-  // MSC is only useful while USB is connected; expose it unconditionally so
-  // the rare "plugged in after boot" case still works.
-  usb_msc::begin();
-  dfu_legacy::set_progress_callback(on_dfu_progress);
-
   bool cfg_loaded = false;
   if (s_storage_ok) cfg_loaded = config::load();
+
+  // Finish every firmware-side filesystem access before exposing the raw
+  // block device. From this point until eject, logger writes are Serial-only.
+  if (s_storage_ok && !storage::prepare_for_host_access()) {
+    Serial.println("storage: failed to prepare filesystem for USB host");
+    s_storage_ok = false;
+  }
+  // MSC is only useful while USB is connected; expose it unconditionally so
+  // the rare "plugged in after boot" case still works.
+  usb_msc::begin(vbus);
+  dfu_legacy::set_progress_callback(on_dfu_progress);
+
   const config::Config& cfg = config::current();
 
   // BLE init has to come AFTER config so we can apply tx_power before
@@ -318,7 +334,7 @@ void setup() {
 
   // Boot-without-USB-power trigger: if we came up on battery and there's
   // already a zip on the drive, jump straight into DFU. This matches the
-  // requirements' "physical unplug → board flashes target" workflow when
+  // requirements' "physical unplug -> board flashes target" workflow when
   // the XIAO has a battery wired to BAT+/BAT-.
   if (!vbus && s_storage_ok) {
     char zip_name[64];
@@ -337,6 +353,22 @@ void loop() {
     bool eject_trig = s_storage_ok && usb_msc::was_ejected();
     if (eject_trig || s_armed_boot) {
       logger::log("dfu: trigger %s", eject_trig ? "eject" : "boot-no-vbus");
+      // Quiesce host access, then invalidate the SdFat view one final time.
+      // Otherwise a ZIP copied after boot can be hidden by cached root/FAT
+      // sectors and appear only after one or more updater reboots.
+      usb_msc::set_ready(false);
+      storage::refresh_after_host_write();
+      bool const cfg_loaded = config::load();
+      const config::Config& cfg = config::current();
+      ble_scanner::set_tx_power(cfg.tx_power);
+      ble_scanner::set_debug(cfg.scan_debug);
+      logger::log(
+        "cfg: reloaded=%s ble_name='%s' prn=%u high_mtu=%d retries=%u "
+        "min_rssi=%d tx_power=%d scan_timeout=%u scan_debug=%d",
+        cfg_loaded ? "CONFIG.TXT" : "defaults", cfg.ble_name, cfg.prn,
+        (int)cfg.high_mtu, cfg.retries, (int)cfg.min_rssi,
+        (int)cfg.tx_power, cfg.scan_timeout, (int)cfg.scan_debug
+      );
       s_armed_boot = false;
       s_state      = State::kRunning;
       run_dfu_sequence();   // blocking, sets s_state to kDoneOk / kDoneFail

@@ -32,13 +32,13 @@ void log(const char* fmt, ...) {
   if (total < 0) return;
   if (total >= (int)sizeof(line)) total = sizeof(line) - 1;
 
-  // Always mirror to Serial — even when the FS write fails.
+  // Always mirror to Serial - even when the FS write fails.
   Serial.write((const uint8_t*)line, total);
 
-  // Skip the file write while the host has the drive mounted: SdFat and the
-  // host can't safely share the FAT cache, and a write from our side would
-  // race with the host's view. We still keep the Serial mirror.
-  if (usb_msc::is_mounted()) return;
+  // Skip the file write for the host's entire ownership interval, including
+  // the short VBUS-to-mount window. SdFat and raw MSC can't safely share the
+  // FAT cache. We still keep the Serial mirror.
+  if (usb_msc::host_owns_media()) return;
 
   File f = storage::fs().open(kLogPath, O_WRONLY | O_CREAT | O_APPEND);
   if (!f) return;

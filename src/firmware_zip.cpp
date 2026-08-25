@@ -108,9 +108,11 @@ bool parse(const char* zip_path, Parsed* out, char* err, size_t err_len) {
   } else if (m["bootloader"].is<JsonObject>()) {
     if (!resolve(m["bootloader"], &out->bin, &out->dat, err, err_len)) goto fail;
     out->type = TYPE_BOOTLOADER;
+    out->bl_size = out->bin.size;
   } else if (m["softdevice"].is<JsonObject>()) {
     if (!resolve(m["softdevice"], &out->bin, &out->dat, err, err_len)) goto fail;
     out->type = TYPE_SOFTDEVICE;
+    out->sd_size = out->bin.size;
   } else {
     snprintf(err, err_len, "manifest.json: no recognised firmware section");
     goto fail;

@@ -122,7 +122,7 @@ static void put_u32le(uint8_t* p, uint32_t v) {
 // whatever DFU state it accumulated so the *next* attempt starts clean
 // instead of getting INVALID_STATE back on its very first START_DFU.
 //
-// We do NOT initiate the disconnect ourselves — RESET is processed
+// We do NOT initiate the disconnect ourselves - RESET is processed
 // asynchronously and the bootloader needs time to act on it before it
 // reboots. If we disconnect first the bootloader may just terminate the
 // link without ever running its RESET handler, leaving the half-finished
@@ -150,6 +150,64 @@ static Result fail(Result r) {
     }
   }
   return r;
+}
+
+// Disconnect without writing a DFU opcode. Use this when the peer's mode is
+// ambiguous: sending RESET to an application or START_DFU to an unknown peer
+// would turn a read/classification failure into a state-changing operation.
+static Result disconnect_only(Result r) {
+  if (s_connected) {
+    uint16_t const conn_handle = s_conn_handle;
+    Bluefruit.disconnect(conn_handle);
+    wait_disconnected(2000);
+  }
+  return r;
+}
+
+// BLEClientCharacteristic::read() uses the framework's 100 ms generic GATT
+// timeout. That is shorter than a complete request/response on peers that are
+// still using a slow application-mode connection interval, and a timeout is
+// reported as a zero-length read. Read-by-UUID has a 500 ms discovery timeout;
+// retry it a bounded number of times and require exactly the two bytes defined
+// by the Nordic Legacy DFU revision characteristic.
+static bool read_revision(uint16_t* revision) {
+  ble_gattc_handle_range_t const range = s_svc.getHandleRange();
+
+  for (uint8_t attempt = 1; attempt <= 3; attempt++) {
+    uint8_t bytes[2] = {0xA5, 0x5A};
+    uint16_t const len = Bluefruit.Gatt.readCharByUuid(
+      s_conn_handle, s_ver_uuid, bytes, sizeof(bytes),
+      range.start_handle, range.end_handle
+    );
+
+    logger::log(
+      "dfu: revision read %u/3 len=%u raw=%02x%02x",
+      attempt, len, bytes[0], bytes[1]
+    );
+
+    if (!s_connected) return false;
+    if (len == sizeof(bytes)) {
+      *revision = (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+      return true;
+    }
+
+    delay(150);
+  }
+
+  return false;
+}
+
+// Bluefruit implements enableNotify() as a queued CCCD WRITE_CMD. There is no
+// ATT response to wait on, so returning true only means the command entered
+// the local SoftDevice queue. Give the peer enough connection events to apply
+// it before sending a control-point WRITE_REQ. The application-side BLEDfu
+// service explicitly rejects control writes until the CCCD is active.
+static bool enable_control_notifications() {
+  if (!s_ctrl.enableNotify()) return false;
+  delay(250);
+  s_notif_ready = false;
+  s_notif_len = 0;
+  return s_connected;
 }
 
 // ---------- DFU run ----------
@@ -193,7 +251,7 @@ Result run(const ble_scanner::Target& target,
 
   // Optional MTU negotiation. nRF52840 SoftDevice supports up to 247.
   // Many Nordic Legacy DFU bootloaders honour the exchange and let us write
-  // (mtu-3)-byte payloads to the Packet characteristic — typically 5–10x
+  // (mtu-3)-byte payloads to the Packet characteristic - typically 5-10x
   // faster end-to-end than the default 20 B writes.
   uint16_t payload = 20;
   if (cfg.high_mtu) {
@@ -225,37 +283,63 @@ Result run(const ble_scanner::Target& target,
     return fail(Result::kCharMissing);
   }
 
-  // Read the DFU Version characteristic (little-endian uint16). Format is
-  // hi-byte = major, lo-byte = minor:
-  //   0x0001 = 0.1 = app with buttonless support — peer needs trigger
-  //   0x0005+ = 0.5+ = real bootloader — proceed with full DFU
-  uint16_t version = 0;
-  if (ver_ok) {
-    uint8_t verbuf[2] = {0, 0};
-    s_ver.read(verbuf, 2);
-    version = (uint16_t)verbuf[0] | ((uint16_t)verbuf[1] << 8);
-    logger::log("dfu: peer DFU version = %u.%u  (raw 0x%04X)",
-                version >> 8, version & 0xFF, version);
+  // OTAFIX bootloaders advertise the Legacy DFU UUID. MeshCore application
+  // mode exposes the same GATT service after connection but does not put its
+  // UUID in the advertisement. This is more reliable than using a failed
+  // revision read as value 0, which previously misclassified the app as a
+  // bootloader and sent START_DFU to the wrong state machine.
+  // Older builds with an overlong DEVICE_NAME could run out of the 31-byte
+  // advertising payload before adding the UUID. MAC+1 remains independent
+  // bootloader evidence for recovering those deployed builds.
+  bool is_app_mode = !target.advertises_legacy_dfu && !target.mac_plus_one;
+
+  // Read the DFU Version characteristic (little-endian uint16) as an optional
+  // bootloader-side consistency check. The revision is 0.1 in app mode and
+  // 0.5 or newer in a modern Legacy DFU bootloader. Some Bluefruit central
+  // builds cannot complete this read, so the advertised UUID remains the
+  // primary mode signal for supported OTAFIX targets.
+  if (!is_app_mode && !pkt_ok) {
+    logger::log("dfu: bootloader advertisement without Packet characteristic");
+    return fail(Result::kCharMissing);
   }
 
-  // Buttonless detection: prefer the version byte when present. Fall back
-  // to "Packet characteristic missing" for older firmwares that don't
-  // expose the Version characteristic at all.
-  bool is_app_mode = (ver_ok && version == 0x0001) || !pkt_ok;
+  uint16_t version = 0;
+  if (!is_app_mode && ver_ok && read_revision(&version)) {
+    logger::log("dfu: peer DFU version = %u.%u  (raw 0x%04X)",
+                version >> 8, version & 0xFF, version);
+
+    if (version <= 0x0001) {
+      logger::log("dfu: revision contradicts bootloader advertisement; refusing update");
+      return disconnect_only(Result::kRevisionUnreadable);
+    }
+  } else if (!is_app_mode && ver_ok) {
+    logger::log("dfu: revision unreadable; using scan-time bootloader evidence");
+  }
+
   if (is_app_mode) {
+    logger::log("dfu: advertisement omitted DFU UUID; selected peer is app mode");
     logger::log("dfu: peer in app mode, sending buttonless trigger");
-    s_ctrl.enableNotify();
+    if (!enable_control_notifications()) {
+      logger::log("dfu: buttonless notification setup failed");
+      return disconnect_only(Result::kCharMissing);
+    }
     uint8_t enter_bl[2] = { 0x01, 0x04 };
     // write_resp may fail because the peer disconnects before sending the
     // ATT response; that's expected and not an error.
-    s_ctrl.write_resp(enter_bl, sizeof(enter_bl));
-    wait_disconnected(5000);
+    int const written = s_ctrl.write_resp(enter_bl, sizeof(enter_bl));
+    if (written <= 0) {
+      logger::log("dfu: buttonless trigger had no ATT response; waiting for reboot");
+    }
+    if (!wait_disconnected(5000)) {
+      logger::log("dfu: buttonless peer did not reboot");
+      return disconnect_only(Result::kTimeout);
+    }
     return Result::kButtonlessTriggered;
   }
 
   // Enable CCCD on the Control Point so the target's status notifications
   // come back as on_ctrl_notify() callbacks.
-  if (!s_ctrl.enableNotify()) {
+  if (!enable_control_notifications()) {
     logger::log("dfu: enableNotify() failed");
     return fail(Result::kCharMissing);
   }
@@ -269,7 +353,7 @@ Result run(const ble_scanner::Target& target,
   }
   logger::log("dfu: sent START_DFU type=0x%02x", bundle.type);
 
-  // 3 × uint32 LE: SD size, BL size, App size. Per LegacyDfuImpl, even when a
+  // 3 x uint32 LE: SD size, BL size, App size. Per LegacyDfuImpl, even when a
   // field is unused it must still be present and zero.
   uint8_t sizes[12] = {0};
   put_u32le(sizes + 0, bundle.sd_size);
@@ -405,8 +489,16 @@ Result run(const ble_scanner::Target& target,
         logger::log("dfu: PRN timeout at sent=%lu", (unsigned long)sent);
         return fail(Result::kTimeout);
       }
-      s_notif_ready = false;
-      if (s_notif_len >= 5 && s_notif_buf[0] == OP_PKT_RECEIPT_NOTIF) {
+      if (sent == bundle.bin.size && s_notif_len >= 3 &&
+          s_notif_buf[0] == OP_RESPONSE_CODE &&
+          s_notif_buf[1] == OP_RECEIVE_FW) {
+        // The peer may enqueue its final RECEIVE_FW response before the
+        // central has handled the last local write completion. Preserve it
+        // for consume_response() below instead of mistaking it for a PRN and
+        // waiting forever for a notification that already arrived.
+        logger::log("dfu: final response arrived with last PRN burst");
+      } else if (s_notif_len >= 5 && s_notif_buf[0] == OP_PKT_RECEIPT_NOTIF) {
+        s_notif_ready = false;
         uint32_t peer_recv = (uint32_t)s_notif_buf[1] |
                              ((uint32_t)s_notif_buf[2] << 8) |
                              ((uint32_t)s_notif_buf[3] << 16) |
@@ -419,8 +511,9 @@ Result run(const ble_scanner::Target& target,
           return fail(Result::kRemoteError);
         }
       } else {
-        // Could be the final 0x10/0x03 already — we'll handle that after the
-        // stream loop. For now log unexpected and continue.
+        s_notif_ready = false;
+        // Could be the final 0x10/0x03 already - we'll handle that after the
+        // stream loop only when it accompanies the actual final burst.
         logger::log("dfu: unexpected notif during stream  op=0x%02x len=%u",
                     s_notif_buf[0], s_notif_len);
       }
@@ -465,10 +558,10 @@ Result run(const ble_scanner::Target& target,
 
   // -------------------- Activate and reset --------------------
   // ACTIVATE_AND_RESET (0x05) is sent as WRITE_REQ. The peer:
-  //   1. ATT-acks the request (or just disconnects mid-request — both fine)
+  //   1. ATT-acks the request (or just disconnects mid-request - both fine)
   //   2. copies the staged image into its final region (flash erase + write,
   //      hundreds of ms for SD+BL bundles)
-  //   3. resets — which is what tears down the BLE link.
+  //   3. resets - which is what tears down the BLE link.
   //
   // We must NOT call disconnect() ourselves: doing so before step 2 finishes
   // leaves the peer with a partially-applied image and it falls back to the
@@ -476,14 +569,14 @@ Result run(const ble_scanner::Target& target,
   // the link, and we mirror that.
   //
   // WRITE_REQ rather than WRITE_CMD because most Legacy DFU bootloaders'
-  // Control Point chars don't list the WriteWithoutResponse property — the
+  // Control Point chars don't list the WriteWithoutResponse property - the
   // SoftDevice silently drops WRITE_CMDs to those chars, so an ACTIVATE
   // sent as WRITE_CMD never reaches the peer.
   uint8_t activate_cmd[1] = { OP_ACTIVATE_AND_RESET };
   s_ctrl.write_resp(activate_cmd, sizeof(activate_cmd));
 
   logger::log("dfu: ACTIVATE sent, waiting for peer to reset...");
-  // Up to 2 minutes — SD+BL combo bundles do a lot of flash erase+copy work
+  // Up to 2 minutes - SD+BL combo bundles do a lot of flash erase+copy work
   // before they're ready to reboot, and large MTU streams arrive faster than
   // the flash can be cleared, so the post-stream phase can be long.
   if (!wait_disconnected(120000)) {
