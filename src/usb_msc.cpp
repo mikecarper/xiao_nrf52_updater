@@ -16,6 +16,7 @@ static std::atomic<bool>     s_host_owns_media(false);
 static std::atomic<bool>     s_accept_io(true);
 static std::atomic<uint32_t> s_active_io(0);
 static std::atomic<bool>     s_ejected(false);
+static std::atomic<bool>     s_cdc_dtr_dropped(false);
 
 // Closing the gate and then waiting for this counter to reach zero prevents
 // firmware-side SdFat access from racing an MSC callback that passed its first
@@ -101,6 +102,55 @@ bool is_mounted()       { return s_mounted.load(std::memory_order_acquire); }
 bool was_ever_mounted() { return s_ever_mounted.load(std::memory_order_acquire); }
 bool was_ejected()      { return s_ejected.load(std::memory_order_acquire); }
 bool host_owns_media()  { return s_host_owns_media.load(std::memory_order_acquire); }
+
+bool serial_dfu_requested() {
+  if (!s_cdc_dtr_dropped.exchange(false, std::memory_order_acq_rel)) {
+    return false;
+  }
+  return Serial.baud() == 1200;
+}
+
+void note_cdc_dtr_drop() {
+  s_cdc_dtr_dropped.store(true, std::memory_order_release);
+}
+
+bool detach_for_serial_dfu(uint32_t timeout_ms) {
+  // A CDC 1200-baud touch normally resets immediately from TinyUSB's USB
+  // task. On a composite CDC+MSC device Linux may still have a SCSI URB in
+  // flight, and the legacy Raspberry Pi dwc_otg host driver can wedge while
+  // dequeuing it. Move the teardown into loop(): make the LUN unavailable,
+  // stop new raw-flash callbacks, and wait for the one already running.
+  s_msc.setUnitReady(false);
+  s_accept_io.store(false, std::memory_order_release);
+
+  uint32_t const started = millis();
+  while (s_active_io.load(std::memory_order_acquire) != 0) {
+    if ((uint32_t)(millis() - started) >= timeout_ms) {
+      s_accept_io.store(true, std::memory_order_release);
+      s_msc.setUnitReady(true);
+      return false;
+    }
+    delay(1);
+  }
+
+  if (!storage::flash().syncBlocks()) {
+    s_accept_io.store(true, std::memory_order_release);
+    s_msc.setUnitReady(true);
+    return false;
+  }
+
+  // Drop the device pull-up before resetting. This gives the host a normal
+  // disconnect event with no MSC callback outstanding instead of making all
+  // endpoints disappear in the middle of a transaction.
+  if (!TinyUSBDevice.detach()) {
+    s_accept_io.store(true, std::memory_order_release);
+    s_msc.setUnitReady(true);
+    return false;
+  }
+  s_mounted.store(false, std::memory_order_release);
+  s_host_owns_media.store(false, std::memory_order_release);
+  return true;
+}
 
 bool take_media_for_firmware(uint32_t timeout_ms) {
   // Close our callback gate before changing TinyUSB's reported LUN state. A

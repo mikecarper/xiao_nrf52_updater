@@ -49,6 +49,10 @@ bool resolve(JsonObject node, zip_reader::Entry* bin, zip_reader::Entry* dat,
     snprintf(err, err_len, "%s not in zip", bin_name);
     return false;
   }
+  if (bin->size == 0) {
+    snprintf(err, err_len, "%s is empty", bin_name);
+    return false;
+  }
   // Init packet (.dat) is optional in very old DFU bootloaders, but every
   // modern nrfutil bundle includes one. We require it.
   if (!dat_name) {
@@ -57,6 +61,10 @@ bool resolve(JsonObject node, zip_reader::Entry* bin, zip_reader::Entry* dat,
   }
   if (!zip_reader::find(dat_name, dat)) {
     snprintf(err, err_len, "%s not in zip", dat_name);
+    return false;
+  }
+  if (dat->size == 0) {
+    snprintf(err, err_len, "%s is empty", dat_name);
     return false;
   }
   return true;
@@ -80,16 +88,34 @@ bool parse(const char* zip_path, Parsed* out, char* err, size_t err_len) {
   }
 
   JsonObject m = doc["manifest"].as<JsonObject>();
+  uint8_t section_count = 0;
   if (m.isNull()) {
     snprintf(err, err_len, "manifest.json: top-level `manifest` missing");
     zip_reader::close();
     return false;
   }
 
-  // The legacy bootloader can't take SD+BL+App in one go (the Java reference
-  // explicitly splits them across two connections), and we don't have a
-  // sample yet to verify that path. So we accept the simple shapes here:
-  // application / bootloader / softdevice / softdevice_bootloader.
+  // Never silently choose one section from a multi-image package. The Legacy
+  // protocol splits SD+BL+App across two connections; this updater does not
+  // implement that transaction yet. Applying only the first section and then
+  // deleting the ZIP would falsely report a complete update.
+  if (m["softdevice_bootloader_application"].is<JsonObject>()) {
+    snprintf(err, err_len, "SD+BL+App packages are not supported");
+    goto fail;
+  }
+
+  section_count =
+    (uint8_t)m["softdevice_bootloader"].is<JsonObject>() +
+    (uint8_t)m["application"].is<JsonObject>() +
+    (uint8_t)m["bootloader"].is<JsonObject>() +
+    (uint8_t)m["softdevice"].is<JsonObject>();
+  if (section_count != 1) {
+    snprintf(err, err_len, "manifest must contain exactly one firmware section");
+    goto fail;
+  }
+
+  // Accept the simple shapes: application / bootloader / softdevice /
+  // softdevice_bootloader.
   if (m["softdevice_bootloader"].is<JsonObject>()) {
     JsonObject n = m["softdevice_bootloader"];
     if (!resolve(n, &out->bin, &out->dat, err, err_len)) goto fail;
@@ -100,6 +126,11 @@ bool parse(const char* zip_path, Parsed* out, char* err, size_t err_len) {
     out->bl_size = n["bl_size"] | n["info_read_only_metadata"]["bl_size"] | 0u;
     if (out->sd_size == 0 || out->bl_size == 0) {
       snprintf(err, err_len, "softdevice_bootloader missing sd_size / bl_size");
+      goto fail;
+    }
+    if (out->sd_size > UINT32_MAX - out->bl_size ||
+        out->sd_size + out->bl_size != out->bin.size) {
+      snprintf(err, err_len, "softdevice_bootloader sizes do not match bin");
       goto fail;
     }
   } else if (m["application"].is<JsonObject>()) {

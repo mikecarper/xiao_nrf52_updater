@@ -58,6 +58,9 @@ enum class State : uint8_t {
 static State                  s_state     = State::kIdle;
 static bool                   s_storage_ok = false;
 static bool                   s_armed_boot = false;  // VBUS-absent trigger fired
+static bool                   s_vbus_grace = false;
+static uint32_t               s_vbus_grace_deadline = 0;
+static uint32_t               s_unplug_started = 0;
 static firmware_zip::Parsed   s_bundle;
 static volatile uint8_t       s_progress_pct = 0;     // 0..100, updated from dfu_legacy
 
@@ -183,6 +186,24 @@ static void run_dfu_sequence() {
       continue;   // rescan; doesn't count as a DFU retry
     }
 
+    if (r == dfu_legacy::Result::kButtonlessFailed) {
+      // The command may have been rejected (most often because its CCCD was
+      // not active), or the app may have rebooted just after our deadline.
+      // Retain the address fallback either way, but bound retries and use the
+      // short cooldown: no bootloader transfer has started, so this is not a
+      // wedged DFU state machine.
+      pending_app_mac = t.addr;
+      have_pending_app_mac = true;
+      dfu_attempt++;
+      logger::log("dfu: buttonless attempt %u/%u failed",
+                  dfu_attempt, retries);
+      if (dfu_attempt < retries && cooldown > 0) {
+        logger::log("dfu: retry cooldown %u s before next trigger", cooldown);
+        delay((uint32_t)cooldown * 1000);
+      }
+      continue;
+    }
+
     // Anything other than buttonless means the next scan should go back to
     // the normal name/UUID matching.
     have_pending_app_mac = false;
@@ -208,7 +229,9 @@ static void run_dfu_sequence() {
       // drop) suggest the bootloader's DFU state machine is wedged from a
       // half-finished session; only its internal inactivity watchdog
       // unsticks it, so we wait the longer `wedge_cooldown`.
-      bool wedge = (r != dfu_legacy::Result::kConnectFailed);
+      bool wedge = (r == dfu_legacy::Result::kDisconnectedEarly ||
+                    r == dfu_legacy::Result::kTimeout ||
+                    r == dfu_legacy::Result::kRemoteError);
       uint16_t wait_s = wedge ? wedge_cooldown : cooldown;
       if (wait_s > 0) {
         logger::log("dfu: %s cooldown %u s before next attempt",
@@ -300,7 +323,16 @@ void setup() {
   leds_off();
   Serial.begin(115200);
 
-  bool vbus = vbus_present();
+  // USBREGSTATUS can lag a freshly applied USB supply. Poll briefly before
+  // deciding this is a battery boot; a false first sample used to make a USB
+  // power cycle consume the staged ZIP immediately and hide the MSC medium.
+  uint32_t const vbus_poll_deadline = millis() + 500;
+  bool vbus = false;
+  do {
+    vbus = vbus_present();
+    if (vbus) break;
+    delay(10);
+  } while ((int32_t)(vbus_poll_deadline - millis()) > 0);
 
   s_storage_ok = storage::begin();
   bool cfg_loaded = false;
@@ -314,7 +346,10 @@ void setup() {
   }
   // MSC is only useful while USB is connected; expose it unconditionally so
   // the rare "plugged in after boot" case still works.
-  usb_msc::begin(vbus);
+  // When VBUS is initially absent, conservatively reserve media ownership for
+  // a five-second host-enumeration grace period. This keeps logger/SdFat away
+  // from the raw MSC blocks if the hardware VBUS indication was merely late.
+  usb_msc::begin(true);
   dfu_legacy::set_progress_callback(on_dfu_progress);
 
   const config::Config& cfg = config::current();
@@ -332,16 +367,12 @@ void setup() {
               (int)cfg.min_rssi, cfg.retry_cooldown, cfg.wedge_cooldown,
               (int)cfg.tx_power, cfg.scan_timeout, (int)cfg.scan_debug);
 
-  // Boot-without-USB-power trigger: if we came up on battery and there's
-  // already a zip on the drive, jump straight into DFU. This matches the
-  // requirements' "physical unplug -> board flashes target" workflow when
-  // the XIAO has a battery wired to BAT+/BAT-.
+  // A possible battery boot is confirmed in loop() only after giving a USB
+  // host time to enumerate. Real battery operation is delayed five seconds;
+  // a USB power cycle no longer looks like an unplug-to-run trigger.
   if (!vbus && s_storage_ok) {
-    char zip_name[64];
-    if (storage::find_single_zip(zip_name, sizeof(zip_name)) == 1) {
-      logger::log("boot: no VBUS + zip present, arming DFU");
-      s_armed_boot = true;
-    }
+    s_vbus_grace = true;
+    s_vbus_grace_deadline = millis() + 5000;
   }
 }
 
@@ -349,10 +380,52 @@ void loop() {
   uint32_t now = millis();
   leds_tick(now);
 
+  if (usb_msc::serial_dfu_requested()) {
+    logger::log("usb: 1200-baud DFU reset requested; quiescing MSC");
+    if (!usb_msc::detach_for_serial_dfu()) {
+      logger::log("usb: MSC did not quiesce; refusing unsafe reset");
+      return;
+    }
+
+    // Allow the host to finish processing the clean composite-device detach
+    // before the bootloader reconnects under a different USB identity.
+    delay(500);
+    enterSerialDfu();
+  }
+
+  if (s_vbus_grace) {
+    if (vbus_present() || usb_msc::is_mounted()) {
+      s_vbus_grace = false;
+      logger::log("boot: USB host detected during battery-trigger grace");
+    } else if ((int32_t)(s_vbus_grace_deadline - now) <= 0) {
+      s_vbus_grace = false;
+      char zip_name[64];
+      if (storage::find_single_zip(zip_name, sizeof(zip_name)) == 1) {
+        logger::log("boot: no VBUS after 5 s + zip present, arming DFU");
+        s_armed_boot = true;
+      }
+    }
+  }
+
   if (s_state == State::kIdle) {
     bool eject_trig = s_storage_ok && usb_msc::was_ejected();
-    if (eject_trig || s_armed_boot) {
-      logger::log("dfu: trigger %s", eject_trig ? "eject" : "boot-no-vbus");
+    bool const unplug_candidate =
+      s_storage_ok && usb_msc::was_ever_mounted() &&
+      !usb_msc::is_mounted() && !vbus_present();
+    if (unplug_candidate) {
+      if (s_unplug_started == 0) s_unplug_started = now;
+    } else {
+      s_unplug_started = 0;
+    }
+    // A USB bus reset also produces an unmount callback. Require VBUS and the
+    // mounted state to remain absent for two seconds before treating it as a
+    // battery-backed cable removal.
+    bool const unplug_trig =
+      unplug_candidate && (uint32_t)(now - s_unplug_started) >= 2000;
+    if (eject_trig || unplug_trig || s_armed_boot) {
+      const char* trigger = eject_trig ? "eject" :
+                            (unplug_trig ? "USB-unplug" : "boot-no-vbus");
+      logger::log("dfu: trigger %s", trigger);
       // Close MSC access and wait for any in-flight callback before touching
       // SdFat. Otherwise Linux can race a final read against our filesystem
       // refresh and wedge both QSPI and the composite USB device.

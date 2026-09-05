@@ -38,12 +38,11 @@ struct Config {
   // and slamming retries returns INVALID_STATE.
   uint16_t retry_cooldown;
 
-  // Extended cooldown used after a *post-connect* failure (response timeout,
-  // protocol error, link drop mid-stream). SDK 11-era bootloaders that wedge
-  // mid-DFU only unstick when their internal inactivity watchdog fires —
-  // usually 60–120 s. Pre-connect failures (weak signal, link never came up)
-  // still use the short `retry_cooldown`; only failures past the GATT handshake
-  // use this one.
+  // Extended cooldown used after a bootloader protocol failure (response
+  // timeout, remote error, or link drop after START_DFU). SDK 11-era
+  // bootloaders that wedge mid-DFU only unstick when their internal inactivity
+  // watchdog fires — usually 60–120 s. Discovery, classification, and
+  // buttonless-transition failures still use the short `retry_cooldown`.
   uint16_t wedge_cooldown;
 
   // BLE transmit power in dBm. nRF52840 valid values:

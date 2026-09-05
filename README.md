@@ -42,9 +42,12 @@ Two ways to start a DFU sequence:
 | Trigger | When | How it's detected |
 |---|---|---|
 | **Eject** | Host ejects the drive (USB still connected) | SCSI Start-Stop Unit (`load_eject=1, start=0`) callback |
-| **Boot off battery** | XIAO powers up with no VBUS and a `.zip` already on the drive | `NRF_POWER->USBREGSTATUS` read at boot |
+| **USB unplug** | A battery keeps the updater running after its mounted USB cable is removed | Mounted-to-unmounted transition with VBUS absent for 2 seconds |
+| **Boot off battery** | XIAO powers up with no VBUS and a `.zip` already on the drive | VBUS remains absent through a 5-second host-enumeration grace period |
 
 Only one runs per boot; after success or final failure the firmware sits idle until reboot.
+The grace period prevents a freshly applied USB supply whose hardware VBUS bit
+is late from being mistaken for a battery boot.
 
 ## CONFIG.TXT
 
@@ -81,11 +84,11 @@ retries=3
 # settle after a reset before it'll accept another START_DFU.
 retry_cooldown=5
 
-# Seconds to wait after a *post-connect* failure (response timeout,
-# protocol error, link drop mid-stream). SDK 11-era bootloaders (stock
+# Seconds to wait after a bootloader-protocol failure (response timeout,
+# remote error, or link drop after START_DFU). SDK 11-era bootloaders (stock
 # Adafruit / RAK4631) that wedge mid-DFU only unstick when their internal
-# inactivity watchdog fires - usually 60-120 s. Pre-connect failures still
-# use the short retry_cooldown above.
+# inactivity watchdog fires - usually 60-120 s. Discovery, classification,
+# and buttonless failures use the short retry_cooldown above.
 wedge_cooldown=60
 
 # Minimum RSSI (dBm, negative). Ads weaker than this are rejected during
@@ -118,7 +121,11 @@ Notes:
 - `ble_name` accepts multiple substrings joined by `|`. Example: `RAK4631 | 4631_DFU` matches the RAK app *and* its bootloader, which advertise under different names.
 - **MAC+1 fallback after buttonless**: after we send the buttonless trigger, the next scan automatically also accepts the same MAC or MAC+1 (Nordic's bootloader convention). This works both for the existing buttonless flow and for the optional `ble_mac` target mode.
 
-`retries` only counts post-scan DFU attempts. Scan failures (with `scan_timeout=0`, impossible) and buttonless triggers don't consume retries.
+`retries` only counts post-scan DFU attempts. Scan failures (with
+`scan_timeout=0`, impossible) and successful buttonless transitions don't
+consume retries. A rejected or timed-out buttonless transition does consume a
+retry, retains the app MAC/MAC+1 fallback, and uses `retry_cooldown` rather than
+the longer bootloader-wedge cooldown.
 
 ## LED indicators
 
@@ -193,6 +200,13 @@ pio device monitor                        # 115200 baud, watches serial
 Requirements: PlatformIO with the upstream `nordicnrf52` platform. The project's `platformio.ini` pins the BSP to a meshcore-dev fork of `framework-arduinoadafruitnrf52` (BLE stack patches). Board JSONs and linker script are vendored under `boards/`. Variants under `variants/xiao_nrf52/` and `variants/rak4631/`.
 
 No bootloader replacement is required on either board - the factory UF2 bootloader works.
+
+The updater also makes its own serial upgrade path safe for the composite USB
+device. A 1200-baud touch is deferred to the main task; the firmware marks the
+MSC LUN unavailable, closes and drains the raw-flash I/O gate, flushes QSPI,
+detaches USB for 500 ms, and only then resets into the bootloader. If storage
+does not quiesce within 2 seconds, it refuses the reset instead of dropping an
+active host request.
 
 ## Project layout
 

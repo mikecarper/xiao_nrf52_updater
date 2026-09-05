@@ -43,6 +43,21 @@ static BLEClientCharacteristic  s_ver (s_ver_uuid);
 static volatile bool     s_connected   = false;
 static volatile uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
 
+// Bluefruit's BLEClientCharacteristic::write_resp() reports the requested
+// length even when the peer returns an ATT error, and writeCCCD() uses an
+// unacknowledged WRITE_CMD. The application-side BLEDfu service refuses its
+// buttonless command unless the Control Point CCCD is active, so use the
+// SoftDevice GATT client directly and retain the real response status.
+static volatile bool     s_desc_pending = false;
+static volatile bool     s_desc_done    = false;
+static volatile uint16_t s_desc_status  = 0xFFFF;
+static volatile uint16_t s_cccd_handle  = BLE_GATT_HANDLE_INVALID;
+
+static volatile bool     s_write_pending = false;
+static volatile bool     s_write_done    = false;
+static volatile uint16_t s_write_handle  = BLE_GATT_HANDLE_INVALID;
+static volatile uint16_t s_write_status  = 0xFFFF;
+
 static volatile bool     s_notif_ready = false;
 static uint8_t           s_notif_buf[20];
 static uint8_t           s_notif_len   = 0;
@@ -72,6 +87,39 @@ static void on_ctrl_notify(BLEClientCharacteristic* chr, uint8_t* data, uint16_t
   s_notif_ready = true;
 }
 
+static void on_ble_event(ble_evt_t* evt) {
+  uint16_t const conn_handle = evt->evt.common_evt.conn_handle;
+  if (conn_handle != s_conn_handle) return;
+
+  if (evt->header.evt_id == BLE_GATTC_EVT_DESC_DISC_RSP && s_desc_pending) {
+    ble_gattc_evt_t const* gattc = &evt->evt.gattc_evt;
+    ble_gattc_evt_desc_disc_rsp_t const* rsp = &gattc->params.desc_disc_rsp;
+
+    s_desc_status = gattc->gatt_status;
+    if (gattc->gatt_status == BLE_GATT_STATUS_SUCCESS) {
+      for (uint16_t i = 0; i < rsp->count; i++) {
+        if (rsp->descs[i].uuid.type == BLE_UUID_TYPE_BLE &&
+            rsp->descs[i].uuid.uuid == BLE_UUID_DESCRIPTOR_CLIENT_CHAR_CONFIG) {
+          s_cccd_handle = rsp->descs[i].handle;
+          break;
+        }
+      }
+    }
+    s_desc_pending = false;
+    s_desc_done = true;
+  }
+
+  if (evt->header.evt_id == BLE_GATTC_EVT_WRITE_RSP && s_write_pending) {
+    ble_gattc_evt_t const* gattc = &evt->evt.gattc_evt;
+    ble_gattc_evt_write_rsp_t const* rsp = &gattc->params.write_rsp;
+    if (rsp->handle == s_write_handle) {
+      s_write_status = gattc->gatt_status;
+      s_write_pending = false;
+      s_write_done = true;
+    }
+  }
+}
+
 // ---------- Helpers ----------
 static bool wait_connected(uint32_t timeout_ms) {
   uint32_t deadline = millis() + timeout_ms;
@@ -91,6 +139,86 @@ static bool wait_notification(uint32_t timeout_ms) {
     delay(20);
   }
   return s_notif_ready;
+}
+
+enum class GattWriteResult {
+  kSuccess,
+  kDisconnected,
+  kGattError,
+  kLocalError,
+  kTimeout,
+};
+
+static GattWriteResult write_request(uint16_t handle, const void* data,
+                                     uint16_t len, uint32_t timeout_ms) {
+  ble_gattc_write_params_t params = {
+    .write_op = BLE_GATT_OP_WRITE_REQ,
+    .flags = 0,
+    .handle = handle,
+    .offset = 0,
+    .len = len,
+    .p_value = (uint8_t*)data,
+  };
+
+  s_write_handle = handle;
+  s_write_status = 0xFFFF;
+  s_write_done = false;
+  s_write_pending = true;
+
+  uint32_t const deadline = millis() + timeout_ms;
+  uint32_t err;
+  do {
+    err = sd_ble_gattc_write(s_conn_handle, &params);
+    if (err == NRF_SUCCESS) break;
+    if (err != NRF_ERROR_BUSY && err != NRF_ERROR_RESOURCES) {
+      s_write_pending = false;
+      logger::log("dfu: GATT write handle=0x%04x submit error=0x%08lx",
+                  handle, (unsigned long)err);
+      return GattWriteResult::kLocalError;
+    }
+    delay(20);
+  } while (s_connected && (int32_t)(deadline - millis()) > 0);
+
+  if (err != NRF_SUCCESS) {
+    s_write_pending = false;
+    // No request reached the peer. Do not treat a disconnect while the
+    // SoftDevice was BUSY as the expected post-command reboot: callers may
+    // accept kDisconnected only after a WRITE_REQ was successfully queued.
+    if (!s_connected) {
+      logger::log("dfu: GATT write handle=0x%04x disconnected before submit",
+                  handle);
+      return GattWriteResult::kLocalError;
+    }
+    logger::log("dfu: GATT write handle=0x%04x stayed busy", handle);
+    return GattWriteResult::kTimeout;
+  }
+
+  while (!s_write_done && s_connected &&
+         (int32_t)(deadline - millis()) > 0) {
+    delay(20);
+  }
+
+  s_write_pending = false;
+  if (!s_connected && !s_write_done) return GattWriteResult::kDisconnected;
+  if (!s_write_done) {
+    logger::log("dfu: GATT write handle=0x%04x response timeout", handle);
+    return GattWriteResult::kTimeout;
+  }
+  if (s_write_status != BLE_GATT_STATUS_SUCCESS) {
+    logger::log("dfu: GATT write handle=0x%04x ATT status=0x%04x",
+                handle, s_write_status);
+    return GattWriteResult::kGattError;
+  }
+  return GattWriteResult::kSuccess;
+}
+
+static GattWriteResult write_control(const void* data, uint16_t len,
+                                     uint32_t timeout_ms = 3000) {
+  return write_request(s_ctrl.valueHandle(), data, len, timeout_ms);
+}
+
+static bool write_control_ok(const void* data, uint16_t len) {
+  return write_control(data, len) == GattWriteResult::kSuccess;
 }
 
 // Validate a control-point response notification. Expected layout: [0x10, <op>, <status>].
@@ -130,16 +258,15 @@ static void put_u32le(uint8_t* p, uint32_t v) {
 static Result fail(Result r) {
   if (s_connected) {
     uint8_t reset_cmd[1] = { OP_RESET };
-    // Use WRITE_REQ (write_resp). The Control Point characteristic on most
+    // Use an acknowledged WRITE_REQ. The Control Point characteristic on most
     // Nordic Legacy DFU bootloaders only advertises Write (no WriteWithout-
     // Response), and the SoftDevice silently drops WRITE_CMDs to chars that
-    // don't list that property. write_resp blocks until either the peer ACKs
-    // or it times out.
+    // don't list that property.
     //
     // The return value is intentionally ignored: even if our local write
     // queue refuses (because the link is already half-dead), the disconnect
     // path below still cleans up.
-    s_ctrl.write_resp(reset_cmd, sizeof(reset_cmd));
+    (void)write_control(reset_cmd, sizeof(reset_cmd));
     // Wait for the bootloader to drop the link as a side-effect of RESET.
     // 3 s covers the typical "process command + reboot" round trip. If it
     // doesn't happen we force a local disconnect so we don't stall here.
@@ -197,14 +324,66 @@ static bool read_revision(uint16_t* revision) {
   return false;
 }
 
-// Bluefruit implements enableNotify() as a queued CCCD WRITE_CMD. There is no
-// ATT response to wait on, so returning true only means the command entered
-// the local SoftDevice queue. Give the peer enough connection events to apply
-// it before sending a control-point WRITE_REQ. The application-side BLEDfu
-// service explicitly rejects control writes until the CCCD is active.
+// Bluefruit implements enableNotify() as a queued CCCD WRITE_CMD. Some peers
+// silently reject that opcode for descriptors. Discover the exact descriptor,
+// write it with an acknowledged request, and require a successful ATT status.
+// The application-side BLEDfu service explicitly rejects control writes until
+// the CCCD is active.
 static bool enable_control_notifications() {
-  if (!s_ctrl.enableNotify()) return false;
-  delay(250);
+  uint16_t const ctrl_handle = s_ctrl.valueHandle();
+  ble_gattc_handle_range_t range = {
+    .start_handle = (uint16_t)(ctrl_handle + 1U),
+    .end_handle = s_svc.getHandleRange().end_handle,
+  };
+
+  // Stop descriptor discovery at the next characteristic declaration. This
+  // prevents accidentally selecting another characteristic's CCCD if a peer
+  // exposes additional descriptors after the DFU Control Point.
+  uint16_t const values[] = {s_pkt.valueHandle(), s_ver.valueHandle()};
+  for (uint8_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    if (values[i] > ctrl_handle + 1U) {
+      uint16_t const candidate_end = (uint16_t)(values[i] - 2U);
+      if (candidate_end < range.end_handle) range.end_handle = candidate_end;
+    }
+  }
+  if (range.start_handle > range.end_handle) return false;
+
+  s_cccd_handle = BLE_GATT_HANDLE_INVALID;
+  s_desc_status = 0xFFFF;
+  s_desc_done = false;
+  s_desc_pending = true;
+
+  uint32_t err = sd_ble_gattc_descriptors_discover(s_conn_handle, &range);
+  if (err != NRF_SUCCESS) {
+    s_desc_pending = false;
+    logger::log("dfu: CCCD discovery submit error=0x%08lx",
+                (unsigned long)err);
+    return false;
+  }
+
+  uint32_t const deadline = millis() + 3000;
+  while (!s_desc_done && s_connected &&
+         (int32_t)(deadline - millis()) > 0) {
+    delay(20);
+  }
+  s_desc_pending = false;
+
+  if (!s_desc_done || s_desc_status != BLE_GATT_STATUS_SUCCESS ||
+      s_cccd_handle == BLE_GATT_HANDLE_INVALID) {
+    logger::log("dfu: Control Point CCCD discovery failed status=0x%04x",
+                s_desc_status);
+    return false;
+  }
+
+  uint8_t const notify[2] = {0x01, 0x00};
+  if (write_request(s_cccd_handle, notify, sizeof(notify), 3000) !=
+      GattWriteResult::kSuccess) {
+    logger::log("dfu: Control Point CCCD write failed");
+    return false;
+  }
+
+  logger::log("dfu: Control Point notifications enabled (CCCD=0x%04x)",
+              s_cccd_handle);
   s_notif_ready = false;
   s_notif_len = 0;
   return s_connected;
@@ -216,17 +395,26 @@ Result run(const ble_scanner::Target& target,
            const config::Config& cfg) {
   Bluefruit.Central.setConnectCallback(on_connect);
   Bluefruit.Central.setDisconnectCallback(on_disconnect);
+  Bluefruit.setEventCallback(on_ble_event);
 
-  s_svc.begin();
-  s_ctrl.setNotifyCallback(on_ctrl_notify);
-  s_ctrl.begin();
-  s_pkt.begin();
-  s_ver.begin();
+  static bool clients_begun = false;
+  if (!clients_begun) {
+    s_svc.begin();
+    s_ctrl.setNotifyCallback(on_ctrl_notify);
+    s_ctrl.begin();
+    s_pkt.begin();
+    s_ver.begin();
+    clients_begun = true;
+  }
 
   s_connected   = false;
   s_conn_handle = BLE_CONN_HANDLE_INVALID;
   s_notif_ready = false;
   s_notif_len   = 0;
+  s_desc_pending = false;
+  s_desc_done = false;
+  s_write_pending = false;
+  s_write_done = false;
 
   ble_gap_addr_t addr = target.addr;
   logger::log("dfu: connecting to %02X:%02X:%02X:%02X:%02X:%02X",
@@ -272,7 +460,7 @@ Result run(const ble_scanner::Target& target,
 
   if (!s_svc.discover(s_conn_handle)) {
     logger::log("dfu: DFU service not present on peer");
-    return fail(Result::kServiceMissing);
+    return disconnect_only(Result::kServiceMissing);
   }
   bool ctrl_ok = s_ctrl.discover();
   bool pkt_ok  = s_pkt.discover();
@@ -280,40 +468,35 @@ Result run(const ble_scanner::Target& target,
   logger::log("dfu: chars present  ctrl=%d  packet=%d  version=%d",
               (int)ctrl_ok, (int)pkt_ok, (int)ver_ok);
   if (!ctrl_ok) {
-    return fail(Result::kCharMissing);
+    return disconnect_only(Result::kCharMissing);
   }
 
-  // OTAFIX bootloaders advertise the Legacy DFU UUID. MeshCore application
-  // mode exposes the same GATT service after connection but does not put its
-  // UUID in the advertisement. This is more reliable than using a failed
-  // revision read as value 0, which previously misclassified the app as a
-  // bootloader and sent START_DFU to the wrong state machine.
-  // Older builds with an overlong DEVICE_NAME could run out of the 31-byte
-  // advertising payload before adding the UUID. MAC+1 remains independent
-  // bootloader evidence for recovering those deployed builds.
+  // Start with scan-time evidence. MeshCore applications normally omit the
+  // Legacy DFU UUID, while OTAFIX bootloaders include it. This remains the
+  // fallback for peers whose revision characteristic cannot be read.
   bool is_app_mode = !target.advertises_legacy_dfu && !target.mac_plus_one;
 
-  // Read the DFU Version characteristic (little-endian uint16) as an optional
-  // bootloader-side consistency check. The revision is 0.1 in app mode and
-  // 0.5 or newer in a modern Legacy DFU bootloader. Some Bluefruit central
-  // builds cannot complete this read, so the advertised UUID remains the
-  // primary mode signal for supported OTAFIX targets.
-  if (!is_app_mode && !pkt_ok) {
-    logger::log("dfu: bootloader advertisement without Packet characteristic");
-    return fail(Result::kCharMissing);
-  }
-
+  // A successful live revision read is stronger than advertising. Some
+  // applications advertise the DFU UUID, and some bootloader names consume
+  // all 31 advertising bytes before the UUID. Revision 0.1 is application
+  // mode; Nordic Legacy DFU bootloaders are 0.5 or newer. Ambiguous/unreadable
+  // values deliberately leave the scan-time classification unchanged.
   uint16_t version = 0;
-  if (!is_app_mode && ver_ok && read_revision(&version)) {
+  if (ver_ok && read_revision(&version)) {
     logger::log("dfu: peer DFU version = %u.%u  (raw 0x%04X)",
                 version >> 8, version & 0xFF, version);
-
-    if (version <= 0x0001) {
-      logger::log("dfu: revision contradicts bootloader advertisement; refusing update");
-      return disconnect_only(Result::kRevisionUnreadable);
+    if (version == 0x0001) {
+      is_app_mode = true;
+    } else if (version >= 0x0005) {
+      is_app_mode = false;
     }
-  } else if (!is_app_mode && ver_ok) {
+  } else if (ver_ok) {
     logger::log("dfu: revision unreadable; using scan-time bootloader evidence");
+  }
+
+  if (!is_app_mode && !pkt_ok) {
+    logger::log("dfu: bootloader mode without Packet characteristic");
+    return disconnect_only(Result::kCharMissing);
   }
 
   if (is_app_mode) {
@@ -321,18 +504,21 @@ Result run(const ble_scanner::Target& target,
     logger::log("dfu: peer in app mode, sending buttonless trigger");
     if (!enable_control_notifications()) {
       logger::log("dfu: buttonless notification setup failed");
-      return disconnect_only(Result::kCharMissing);
+      return disconnect_only(Result::kButtonlessFailed);
     }
     uint8_t enter_bl[2] = { 0x01, 0x04 };
-    // write_resp may fail because the peer disconnects before sending the
-    // ATT response; that's expected and not an error.
-    int const written = s_ctrl.write_resp(enter_bl, sizeof(enter_bl));
-    if (written <= 0) {
-      logger::log("dfu: buttonless trigger had no ATT response; waiting for reboot");
+    // The peer may disconnect before its ATT response reaches us; that is an
+    // expected successful transition as long as the request was submitted.
+    GattWriteResult const trigger =
+      write_control(enter_bl, sizeof(enter_bl), 3000);
+    if (trigger != GattWriteResult::kSuccess &&
+        trigger != GattWriteResult::kDisconnected) {
+      logger::log("dfu: buttonless trigger was not accepted");
+      return disconnect_only(Result::kButtonlessFailed);
     }
-    if (!wait_disconnected(5000)) {
+    if (!wait_disconnected(10000)) {
       logger::log("dfu: buttonless peer did not reboot");
-      return disconnect_only(Result::kTimeout);
+      return disconnect_only(Result::kButtonlessFailed);
     }
     return Result::kButtonlessTriggered;
   }
@@ -340,14 +526,14 @@ Result run(const ble_scanner::Target& target,
   // Enable CCCD on the Control Point so the target's status notifications
   // come back as on_ctrl_notify() callbacks.
   if (!enable_control_notifications()) {
-    logger::log("dfu: enableNotify() failed");
-    return fail(Result::kCharMissing);
+    logger::log("dfu: Control Point notification setup failed");
+    return disconnect_only(Result::kCharMissing);
   }
   logger::log("dfu: notifications enabled");
 
   // -------------------- Start DFU + image sizes --------------------
   uint8_t start_cmd[2] = { OP_START_DFU, bundle.type };
-  if (s_ctrl.write_resp(start_cmd, sizeof(start_cmd)) <= 0) {
+  if (!write_control_ok(start_cmd, sizeof(start_cmd))) {
     logger::log("dfu: Start DFU write failed");
     return fail(Result::kDisconnectedEarly);
   }
@@ -377,7 +563,7 @@ Result run(const ble_scanner::Target& target,
   uint8_t init_start[2]    = { OP_INIT_DFU_PARAMS, 0x00 };
   uint8_t init_complete[2] = { OP_INIT_DFU_PARAMS, 0x01 };
 
-  if (s_ctrl.write_resp(init_start, sizeof(init_start)) <= 0) {
+  if (!write_control_ok(init_start, sizeof(init_start))) {
     logger::log("dfu: INIT_DFU_PARAMS start write failed");
     return fail(Result::kDisconnectedEarly);
   }
@@ -407,9 +593,8 @@ Result run(const ble_scanner::Target& target,
   // SoftDevice sometimes rejects the queued WRITE_REQ.
   delay(50);
 
-  int r = s_ctrl.write_resp(init_complete, sizeof(init_complete));
-  if (r <= 0) {
-    logger::log("dfu: INIT_DFU_PARAMS complete write_resp -> %d", r);
+  if (!write_control_ok(init_complete, sizeof(init_complete))) {
+    logger::log("dfu: INIT_DFU_PARAMS complete write failed");
     return fail(Result::kDisconnectedEarly);
   }
 
@@ -424,7 +609,7 @@ Result run(const ble_scanner::Target& target,
   uint8_t prn_cmd[3] = { OP_PKT_RECEIPT_NOTIF_REQ,
                          (uint8_t)(prn & 0xFF),
                          (uint8_t)(prn >> 8) };
-  if (s_ctrl.write_resp(prn_cmd, sizeof(prn_cmd)) <= 0) {
+  if (!write_control_ok(prn_cmd, sizeof(prn_cmd))) {
     logger::log("dfu: PRN set write failed");
     return fail(Result::kDisconnectedEarly);
   }
@@ -432,7 +617,7 @@ Result run(const ble_scanner::Target& target,
 
   // -------------------- Receive Firmware Image --------------------
   uint8_t recv_cmd[1] = { OP_RECEIVE_FW };
-  if (s_ctrl.write_resp(recv_cmd, sizeof(recv_cmd)) <= 0) {
+  if (!write_control_ok(recv_cmd, sizeof(recv_cmd))) {
     logger::log("dfu: RECEIVE_FW write failed");
     return fail(Result::kDisconnectedEarly);
   }
@@ -548,7 +733,7 @@ Result run(const ble_scanner::Target& target,
 
   // -------------------- Validate --------------------
   uint8_t validate_cmd[1] = { OP_VALIDATE };
-  if (s_ctrl.write_resp(validate_cmd, sizeof(validate_cmd)) <= 0) {
+  if (!write_control_ok(validate_cmd, sizeof(validate_cmd))) {
     logger::log("dfu: VALIDATE write failed");
     return fail(Result::kDisconnectedEarly);
   }
@@ -573,7 +758,13 @@ Result run(const ble_scanner::Target& target,
   // SoftDevice silently drops WRITE_CMDs to those chars, so an ACTIVATE
   // sent as WRITE_CMD never reaches the peer.
   uint8_t activate_cmd[1] = { OP_ACTIVATE_AND_RESET };
-  s_ctrl.write_resp(activate_cmd, sizeof(activate_cmd));
+  GattWriteResult const activate =
+    write_control(activate_cmd, sizeof(activate_cmd));
+  if (activate != GattWriteResult::kSuccess &&
+      activate != GattWriteResult::kDisconnected) {
+    logger::log("dfu: ACTIVATE was not accepted");
+    return fail(Result::kRemoteError);
+  }
 
   logger::log("dfu: ACTIVATE sent, waiting for peer to reset...");
   // Up to 2 minutes - SD+BL combo bundles do a lot of flash erase+copy work

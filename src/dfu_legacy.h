@@ -18,6 +18,8 @@ enum class Result {
   kOk,
   kButtonlessTriggered,   // Peer was in app mode; we kicked it into bootloader.
                           // Caller should wait ~2 s and rescan.
+  kButtonlessFailed,      // App-mode trigger was rejected or did not reboot.
+                          // Caller should retain the MAC and use a short retry.
   kConnectFailed,
   kServiceMissing,
   kCharMissing,
