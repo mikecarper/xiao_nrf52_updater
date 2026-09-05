@@ -353,11 +353,15 @@ void loop() {
     bool eject_trig = s_storage_ok && usb_msc::was_ejected();
     if (eject_trig || s_armed_boot) {
       logger::log("dfu: trigger %s", eject_trig ? "eject" : "boot-no-vbus");
-      // Quiesce host access, then invalidate the SdFat view one final time.
-      // Otherwise a ZIP copied after boot can be hidden by cached root/FAT
-      // sectors and appear only after one or more updater reboots.
-      usb_msc::set_ready(false);
-      storage::refresh_after_host_write();
+      // Close MSC access and wait for any in-flight callback before touching
+      // SdFat. Otherwise Linux can race a final read against our filesystem
+      // refresh and wedge both QSPI and the composite USB device.
+      if (!usb_msc::take_media_for_firmware()) {
+        logger::log("dfu: failed to acquire USB media safely");
+        s_armed_boot = false;
+        s_state      = State::kDoneFail;
+        return;
+      }
       bool const cfg_loaded = config::load();
       const config::Config& cfg = config::current();
       ble_scanner::set_tx_power(cfg.tx_power);

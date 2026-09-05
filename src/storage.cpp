@@ -19,12 +19,12 @@ bool prepare_for_host_access() {
   return s_flash.syncBlocks();
 }
 
-void refresh_after_host_write() {
+bool refresh_after_host_write() {
   // Raw MSC writes land in the flash library's erase cache. Commit those
   // first, then discard the now-stale (and, by ownership contract, clean)
   // SdFat sector cache before opening files from firmware.
-  s_flash.syncBlocks();
-  s_fatfs.cacheClear();
+  if (!s_flash.syncBlocks()) return false;
+  return s_fatfs.cacheClear() != nullptr;
 }
 
 // Board-specific QSPI pinout + drive label. XIAO routes its on-board Puya

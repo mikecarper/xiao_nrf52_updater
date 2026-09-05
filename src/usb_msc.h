@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 namespace usb_msc {
 
 // Start exposing QSPI as a USB disk. `host_present` must reflect VBUS at
@@ -23,8 +25,9 @@ bool host_owns_media();
 // in, so tud_umount_cb does NOT fire). Once latched, stays true.
 bool was_ejected();
 
-// Disable / re-enable the MSC LUN. We disable while running DFU so the host
-// can't write to the flash mid-operation.
-void set_ready(bool ready);
+// Atomically stop accepting raw MSC I/O, wait for any callback that already
+// entered to finish, flush the flash write cache, and invalidate SdFat's stale
+// view. On success firmware owns the medium and may safely open files.
+bool take_media_for_firmware(uint32_t timeout_ms = 1000);
 
 }  // namespace usb_msc

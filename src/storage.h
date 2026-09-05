@@ -18,7 +18,7 @@ bool prepare_for_host_access();
 // sectors before firmware-side file access. The USB host and SdFat use the
 // same flash through different paths, so an eject alone does not make an old
 // in-RAM directory cache coherent.
-void refresh_after_host_write();
+bool refresh_after_host_write();
 
 // Scan the FAT root directory for exactly one `*.zip` file (case-insensitive).
 // On success copies the 8.3 / long filename into `out` and returns the count

@@ -28,9 +28,10 @@ Intended use: a drone-mounted OTA flasher that updates a hard to reach nRF52 rep
 5. The XIAO scans for a target advertising the Legacy DFU service, matching the configured BLE name, or matching the configured BLE MAC address. It optionally sends the buttonless trigger to kick the target from app mode into bootloader, then runs the full DFU sequence.
 6. On success the `.zip` is deleted from the drive; the `LOG.TXT` keeps the history.
 
-Eject is the commit boundary: the updater makes its MSC LUN unavailable,
-flushes raw flash writes, and invalidates its FAT cache before looking for the
-ZIP. It also reloads `CONFIG.TXT` and reapplies TX power and scan diagnostics.
+Eject is the commit boundary: the updater closes an MSC I/O gate, waits for
+any in-flight host callback, makes its LUN unavailable, flushes raw flash
+writes, and invalidates its FAT cache before looking for the ZIP. It also
+reloads `CONFIG.TXT` and reapplies TX power and scan diagnostics.
 A package or configuration copied after the updater boot therefore does not
 require an extra reboot or repeated eject attempts.
 
